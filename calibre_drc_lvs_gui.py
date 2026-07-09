@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 24      # incremental build number, shown top-right in the GUI
+APP_REVISION = 25      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -806,6 +806,65 @@ def scan_rule_files(max_seconds=6.0, max_depth=3, limit=80):
     return {"count": len(dedup), "timed_out": timed_out, "rulefiles": dedup[:limit]}
 
 
+_RULEFILE_PATH_RE = re.compile(
+    r"^(?:Rule File Pathname|RULE FILE)\s*:\s*(\S+)", re.M | re.I)
+
+
+def discover_decks(kind):
+    """Find rule-deck paths this host actually has, by reading the INCLUDE line of
+    existing runsets AND the 'Rule File Pathname' of existing DRC/LVS result logs.
+    Returns readable deck paths, most-recently-used first. Lets a run proceed even
+    when drc_deck/drc_deck_glob aren't configured on this host."""
+    decks, seen = [], set()
+
+    def add(path, mtime, via, depth=0):
+        if not path or depth > 3:
+            return
+        path = os.path.expanduser(os.path.expandvars(path))
+        if not (os.path.isfile(path) and os.access(path, os.R_OK)):
+            return
+        base = os.path.basename(path).lower()
+        if base.endswith((".rcx", ".pex")) or "rcx" in base or "pex" in base:
+            return                                 # extraction deck, not DRC/LVS
+        if base.startswith("_") and base.endswith("_"):
+            # Calibre-Interactive wrapper: resolve to the real deck it INCLUDEs
+            rf = _parse_rule_file(path)
+            if rf and rf.get("deck"):
+                add(rf["deck"], mtime, via + "->INCLUDE", depth + 1)
+            return
+        if path in seen:
+            return
+        seen.add(path)
+        decks.append({"deck": path, "mtime": mtime, "via": via})
+
+    # 1) INCLUDE paths from existing runsets (the real PDK deck)
+    try:
+        for d in scan_rule_files().get("rulefiles", []):
+            if d.get("tool") == kind and d.get("deck"):
+                add(d["deck"], d.get("mtime", 0), "runset:%s" % d.get("cell", "?"))
+    except Exception as e:
+        _dbg("discover_decks scan_rule_files: %s" % e)
+
+    # 2) 'Rule File Pathname'/'RULE FILE' from existing result logs
+    try:
+        pats = ["*.drc.summary"] if kind == "drc" else ["*.lvs.report"]
+        for r in (search_logs(max_seconds=6.0).get("results", [])):
+            if any(fnmatch.fnmatch(r["name"], p) for p in pats):
+                try:
+                    with open(r["path"], "r", errors="replace") as f:
+                        head = f.read(4000)
+                except OSError:
+                    continue
+                m = _RULEFILE_PATH_RE.search(head)
+                if m:
+                    add(m.group(1), r.get("mtime", 0), "log:%s" % r["name"])
+    except Exception as e:
+        _dbg("discover_decks logs: %s" % e)
+
+    decks.sort(key=lambda d: d["mtime"], reverse=True)
+    return decks
+
+
 def recent_layouts(cfg=None, limit=12, max_seconds=6.0, views=("layout",)):
     """Scan the WRITABLE cds.lib libraries for the most recently modified layout
     cellviews (i.e. the design you were just editing). Read-only PDK/other-user
@@ -1326,6 +1385,13 @@ def run_job(job):
                              (_ex, _gl, _cf, cfg.get("drc_deck_glob")))
             sys.stdout.flush()
             deck = _ex or _gl or _cf
+            if not deck:                          # nothing configured -> auto-detect
+                found = discover_decks("drc")
+                if found:
+                    deck = found[0]["deck"]
+                    sys.stdout.write("   deck auto-detected from %s: %s\n" %
+                                     (found[0]["via"], deck))
+                    sys.stdout.flush()
             _require_deck(deck, "DRC")
             _artifact("deck", deck)
             runfile = _write_drc_runset(run_dir, cell, gds, deck, cfg.get("drc_extra_svrf", ""))
@@ -1336,6 +1402,13 @@ def run_job(job):
             result_file = os.path.join(run_dir, "%s.drc.summary" % cell)
         else:
             deck = job.meta.get("deck") or latest_deck("lvs") or cfg["lvs_deck"]
+            if not deck:                          # nothing configured -> auto-detect
+                found = discover_decks("lvs")
+                if found:
+                    deck = found[0]["deck"]
+                    sys.stdout.write("   deck auto-detected from %s: %s\n" %
+                                     (found[0]["via"], deck))
+                    sys.stdout.flush()
             _require_deck(deck, "LVS")
             _artifact("deck", deck)
             _artifact("source net", src_net)
@@ -1613,6 +1686,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"path": dl, "text": txt})
             if path == "/api/decks":
                 return self._send_json(list_decks(q.get("kind", ["drc"])[0]))
+            if path == "/api/discover_decks":
+                return self._send_json({"decks": discover_decks(q.get("kind", ["drc"])[0])})
             if path == "/api/recent_layouts":
                 return self._send_json(recent_layouts())
             if path == "/api/rulefiles":
