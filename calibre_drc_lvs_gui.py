@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 29      # incremental build number, shown top-right in the GUI
+APP_REVISION = 30      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -2027,8 +2027,11 @@ INDEX_HTML = r"""<!doctype html>
     <h2>Run status &nbsp;<span id="jobstate" class="pill muted"></span>
       <button class="sec" id="stopbtn" style="float:right;padding:4px 14px;color:var(--bad);border-color:var(--bad);display:none">&#9632; Stop</button></h2>
     <div id="progwrap" style="margin:2px 0 14px">
-      <div class="progbar"><div id="progfill" class="progfill"></div></div>
-      <div id="progtext" style="font-size:16px;margin-top:7px;color:var(--fg)"></div>
+      <div style="display:flex;align-items:center;gap:14px">
+        <div class="progbar" style="flex:1"><div id="progfill" class="progfill"></div></div>
+        <div id="progpct" style="font-size:24px;font-weight:800;min-width:96px;text-align:right;white-space:nowrap"></div>
+      </div>
+      <div id="progtext" style="font-size:15px;margin-top:7px;color:var(--fg)"></div>
     </div>
     <div id="steps"></div>
     <details open><summary>Live log</summary><pre id="joblog">...</pre></details>
@@ -2526,24 +2529,27 @@ $('#runbtn').onclick=async()=>{
 function fmtDur(s){s=Math.round(s||0);const m=Math.floor(s/60),ss=s%60;
   return m>0?(m+'m'+(ss<10?'0':'')+ss+'s'):(ss+'s');}
 function renderProgress(d,st){
-  const fill=$('#progfill'),txt=$('#progtext');
+  const fill=$('#progfill'),txt=$('#progtext'),pct=$('#progpct');
   fill.classList.remove('indet','bad','good');
-  const big='font-size:20px;font-weight:700';
+  const big='font-size:18px;font-weight:700';
   if(st==='done'){
     fill.classList.add('good');fill.style.width='100%';
-    txt.innerHTML='&#10003; completed in <span style="'+big+';color:var(--good)">'+fmtDur(d.elapsed)+'</span>';
+    pct.innerHTML='<span style="color:var(--good)">&#10003; 100%</span>';
+    txt.innerHTML='completed in <span style="'+big+';color:var(--good)">'+fmtDur(d.elapsed)+'</span>';
   }else if(st==='failed'){
     fill.classList.add('bad');fill.style.width='100%';
-    txt.innerHTML='&#10007; failed after <span style="'+big+';color:var(--bad)">'+fmtDur(d.elapsed)+'</span>';
+    pct.innerHTML='<span style="color:var(--bad)">&#10007;</span>';
+    txt.innerHTML='failed after <span style="'+big+';color:var(--bad)">'+fmtDur(d.elapsed)+'</span>';
   }else if(d.progress!=null){
     fill.style.width=d.progress+'%';
-    txt.innerHTML='<span class="spinner"></span><span style="'+big+';color:var(--acc)">'+d.progress+'%</span>'+
-      ' &bull; elapsed <span style="'+big+'">'+fmtDur(d.elapsed)+'</span>'+
+    pct.innerHTML='<span style="color:var(--acc)">'+d.progress+'%</span>';
+    txt.innerHTML='<span class="spinner"></span>elapsed <span style="'+big+'">'+fmtDur(d.elapsed)+'</span>'+
       (d.eta?(' &bull; <span style="'+big+';color:var(--acc)">~'+fmtDur(d.eta)+'</span> remaining'):'')+
       ' <span class="muted" style="font-size:12px">(est. from prior run)</span>';
   }else{
     fill.classList.add('indet');fill.style.width='35%';
-    txt.innerHTML='<span class="spinner"></span>running&hellip; elapsed <span style="'+big+'">'+fmtDur(d.elapsed)+'</span>'+
+    pct.innerHTML='<span class="spinner"></span>';
+    txt.innerHTML='running&hellip; elapsed <span style="'+big+'">'+fmtDur(d.elapsed)+'</span>'+
       ' <span class="muted" style="font-size:12px">(no prior run for ETA)</span>';
   }
 }
