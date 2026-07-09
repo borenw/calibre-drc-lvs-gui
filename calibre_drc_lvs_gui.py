@@ -574,8 +574,11 @@ def _guess_log_type(name):
     return "log"
 
 
-def search_logs(user=None, extra=None, max_results=800, max_depth=5):
-    """Search /sim/<user> and other common simulation roots for Calibre logs."""
+def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds=8.0):
+    """Search /sim/<user> and other simulation roots for Calibre logs.
+
+    Bounded by wall-clock (max_seconds) so a huge or slow (NFS) root can never
+    hang the UI; progress is written to the debug log per root."""
     with CONFIG_LOCK:
         cfg = dict(CONFIG)
     user = (user or cfg.get("sim_user") or getpass.getuser()).strip()
@@ -599,14 +602,25 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=5):
             seen.add(ap)
             uroots.append(ap)
 
-    results, scanned = [], []
+    deadline = time.time() + max_seconds
+    _dbg("searchlogs: user=%s roots=%s budget=%.1fs" % (user, uroots, max_seconds))
+    results, scanned, timed_out = [], [], False
     for root in uroots:
         exists = os.path.isdir(root)
-        scanned.append({"root": root, "exists": exists})
+        rec = {"root": root, "exists": exists, "hits": 0, "seconds": 0.0, "timed_out": False}
+        scanned.append(rec)
         if not exists:
+            _dbg("searchlogs:   skip (absent) %s" % root)
             continue
+        t0 = time.time()
         base = root.rstrip("/").count("/")
-        for dirpath, dirs, files in os.walk(root):
+        walker = os.walk(root, onerror=lambda e: _dbg("searchlogs:   walk error %s" % e))
+        for dirpath, dirs, files in walker:
+            if time.time() > deadline:
+                timed_out = True
+                rec["timed_out"] = True
+                _dbg("searchlogs:   TIMEOUT while scanning %s (at %s)" % (root, dirpath))
+                break
             if dirpath.rstrip("/").count("/") - base >= max_depth:
                 dirs[:] = []
                 continue
@@ -622,16 +636,21 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=5):
                     results.append({"path": p, "name": fn, "dir": dirpath,
                                     "size": stt.st_size, "mtime": stt.st_mtime,
                                     "type": _guess_log_type(fn)})
+                    rec["hits"] += 1
                     if len(results) >= max_results:
                         break
             if len(results) >= max_results:
                 break
-        if len(results) >= max_results:
+        rec["seconds"] = round(time.time() - t0, 2)
+        _dbg("searchlogs:   %s -> %d hits in %.2fs%s" %
+             (root, rec["hits"], rec["seconds"], " (TIMED OUT)" if rec["timed_out"] else ""))
+        if timed_out or len(results) >= max_results:
             break
     results.sort(key=lambda r: r["mtime"], reverse=True)
+    _dbg("searchlogs: done -> %d logs, timed_out=%s" % (len(results), timed_out))
     return {"user": user, "login": getpass.getuser(), "roots": scanned,
             "count": len(results), "truncated": len(results) >= max_results,
-            "results": results}
+            "timed_out": timed_out, "results": results}
 
 
 def _write_drc_runset(run_dir, cell, gds, deck, extra):
@@ -1467,6 +1486,15 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 async function jget(u){const r=await fetch(u);return r.json();}
+async function jgetT(u,ms){                 // fetch with a hard timeout
+  const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);
+  try{const r=await fetch(u,{signal:c.signal});return await r.json();}
+  finally{clearTimeout(t);}
+}
+async function showDebugTail(target,intro){ // dump the tail of the server debug log on screen
+  let txt='';try{const d=await jget('/api/debuglog');txt=(d.text||'').split('\n').slice(-30).join('\n');}catch(e){}
+  target.innerHTML=intro+'<pre>'+esc(txt||'(debug log empty)')+'</pre>';
+}
 async function jpost(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
 function esc(s){return (s==null?'':(''+s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
@@ -1573,13 +1601,32 @@ async function easyRun(){
     let env=await jget('/api/envcheck');
     if(!env.ok){ const r=await jpost('/api/loadmodules',{}); env=r.status||await jget('/api/envcheck'); }
     renderEnvBanner(env);
-    // 2) find latest DRC log
-    set('<span class="spinner"></span>step 2/4 &mdash; finding your most recent DRC log&hellip;');
-    const s=await jget('/api/searchlogs?user='+encodeURIComponent($('#simuser').value.trim()));
+    // 2) find latest DRC log (bounded; never hang the button)
+    set('<span class="spinner"></span>step 2/4 &mdash; searching for your most recent DRC log (max ~10s)&hellip;');
+    let s;
+    try{ s=await jgetT('/api/searchlogs?user='+encodeURIComponent($('#simuser').value.trim()),15000); }
+    catch(err){
+      await showDebugTail($('#easymsg'),
+        '<span class="pill bad">log search stalled</span> a search root is slow or unreachable '+
+        '(e.g. an NFS mount). Trim <b>sim_roots</b> in the Config tab, then retry. Debug log:');
+      return;
+    }
+    if(s.timed_out){
+      const slow=(s.roots||[]).filter(r=>r.timed_out).map(r=>r.root).join(', ');
+      $('#easymsg').innerHTML='<span class="pill warn">search hit its time budget</span> slow root(s): <b>'+
+        esc(slow)+'</b> &mdash; continuing with '+s.count+' logs found so far. '+
+        '(Trim <b>sim_roots</b> in Config to speed this up.)';
+    }
     // prefer a .drc.summary (has clean cell header); fall back to .drc.results
     const drc=(s.results||[]).find(r=>/\.drc\.summary$/.test(r.name))
            || (s.results||[]).find(r=>r.type==='drc' && /\.drc\.(summary|results)$/.test(r.name));
-    if(!drc){ set('<span class="pill warn">no previous DRC log found</span> pick a design manually below and click Run.'); return; }
+    if(!drc){
+      await showDebugTail($('#easymsg'),
+        '<span class="pill warn">no previous DRC log found</span> in your search roots'+
+        (s.timed_out?' (search also timed out)':'')+'. Pick a design manually below and click Run, '+
+        'or widen <b>sim_roots</b> in Config. Debug log:');
+      return;
+    }
     // 3) read design (lib/cell/view) from that log
     set('<span class="spinner"></span>step 3/4 &mdash; reading design from <b>'+esc(drc.name)+'</b>&hellip;');
     const pf=await jget('/api/prefill?path='+encodeURIComponent(drc.path));
@@ -1669,7 +1716,10 @@ async function doSearch(){
   const u=encodeURIComponent($('#simuser').value.trim());
   const x=encodeURIComponent($('#simextra').value.trim());
   let d;
-  try{ d=await jget('/api/searchlogs?user='+u+'&extra='+x); }
+  try{ d=await jgetT('/api/searchlogs?user='+u+'&extra='+x, 20000); }
+  catch(err){ $('#searchbtn').disabled=false;
+    await showDebugTail($('#searchmsg'),'<span class="pill bad">search stalled</span> a root is slow/unreachable &mdash; trim sim_roots in Config. Debug log:');
+    return; }
   finally{ $('#searchbtn').disabled=false; }
   if($('#simuser').value.trim()==='' && d.user)$('#simuser').value=d.user;
   const found=(d.roots||[]).filter(r=>r.exists).map(r=>r.root);
@@ -1677,7 +1727,8 @@ async function doSearch(){
   $('#searchroots').innerHTML='searched (user=<b>'+esc(d.user)+'</b>): '+
     found.map(r=>'<span style="color:var(--good)">'+esc(r)+'</span>').join(' , ')+
     (miss.length?' &nbsp;| not present: '+miss.map(esc).join(' , '):'');
-  $('#searchmsg').textContent=d.count+' log(s) found'+(d.truncated?' (truncated)':'');
+  $('#searchmsg').innerHTML=d.count+' log(s) found'+(d.truncated?' (truncated)':'')+
+    (d.timed_out?' <span class="pill warn">timed out &mdash; partial; trim sim_roots</span>':'');
   SEARCH_ROWS=d.results||[];
   renderSearchRows();
 }
