@@ -29,6 +29,21 @@ this script runs a small HTTP server **in your current shell**; the browser talk
 `localhost`, and every `strmout` / `calibre` call is a subprocess that inherits
 `os.environ` verbatim. So there's no new terminal and nothing to re-source.
 
+## Updating
+
+> **Note:** `raw.githubusercontent.com` is CDN-cached for ~5 minutes, so right after
+> a push it may serve the previous file. To fetch the **latest** immediately, use the
+> GitHub API endpoint (bypasses the cache):
+
+```bash
+curl -fsSL -H "Accept: application/vnd.github.raw" \
+  "https://api.github.com/repos/borenw/calibre-drc-lvs-gui/contents/calibre_drc_lvs_gui.py?ref=main" \
+  -o calibre_drc_lvs_gui.py
+```
+
+The current build number is shown **top-right in the GUI** (e.g. `rev 24`) — check it
+matches the latest commit after updating.
+
 ## Later runs & configuration
 
 Once downloaded, just:
