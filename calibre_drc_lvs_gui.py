@@ -44,6 +44,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -518,22 +519,32 @@ def _log(job, msg):
         f.write(msg)
 
 
+def _console_step(num, name, state, cwd=None, cmd=None, rc=None):
+    """Print a numbered, flushed progress line to the launching terminal."""
+    if state == "start":
+        sys.stdout.write(
+            "\n" + "=" * 78 + "\n"
+            " %d. %s   [RUNNING]\n"
+            "    copy/paste to reproduce:  cd %s && \\\n    %s\n"
+            % (num, name, shlex.quote(cwd), cmd) + "=" * 78 + "\n")
+    else:
+        mark = "OK" if rc == 0 else "FAILED"
+        sys.stdout.write(" %d. %s   [%s rc=%s]\n" % (num, name, mark, rc))
+    sys.stdout.flush()
+
+
 def _run_step(job, name, cmd_list, cwd):
     with job._lock:
         step = {"name": name, "cmd": " ".join(shlex.quote(c) for c in cmd_list),
                 "rc": None, "state": "running"}
         job.steps.append(step)
+        num = len(job.steps)
+        step["num"] = num
     _log(job, "\n" + "=" * 78 + "\n")
-    _log(job, "### STEP: %s\n### CMD : %s\n### CWD : %s\n" %
-         (name, step["cmd"], cwd))
+    _log(job, "### STEP %d: %s\n### CMD : %s\n### CWD : %s\n" %
+         (num, name, step["cmd"], cwd))
     _log(job, "=" * 78 + "\n")
-    # Echo a copy/paste-able command to the server console (the shell you
-    # launched from) so you can reproduce/debug the exact call by hand.
-    sys.stdout.write("\n" + "=" * 78 + "\n"
-                     "RUN [%s] -- copy/paste to reproduce in this shell:\n\n"
-                     "  cd %s && \\\n  %s\n\n" % (name, shlex.quote(cwd), step["cmd"])
-                     + "=" * 78 + "\n")
-    sys.stdout.flush()
+    _console_step(num, name, "start", cwd, step["cmd"])
     try:
         proc = subprocess.Popen(cmd_list, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
@@ -543,6 +554,7 @@ def _run_step(job, name, cmd_list, cwd):
         _log(job, "!! executable not found: %s\n" % e)
         step["state"] = "failed"
         step["rc"] = 127
+        _console_step(num, name, "end", rc=127)
         return 127
     with open(job.log_path, "a") as lf:
         for line in iter(proc.stdout.readline, ""):
@@ -552,7 +564,8 @@ def _run_step(job, name, cmd_list, cwd):
     rc = proc.wait()
     step["rc"] = rc
     step["state"] = "done" if rc == 0 else "failed"
-    _log(job, "\n### STEP %s finished rc=%d\n" % (name, rc))
+    _log(job, "\n### STEP %d %s finished rc=%d\n" % (num, name, rc))
+    _console_step(num, name, "end", rc=rc)
     return rc
 
 
@@ -894,6 +907,8 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds
                         stt = os.stat(p)
                     except OSError:
                         continue
+                    if not stat.S_ISREG(stt.st_mode):
+                        continue                      # never list dirs/special files
                     results.append({"path": p, "name": fn, "dir": dirpath,
                                     "size": stt.st_size, "mtime": stt.st_mtime,
                                     "type": _guess_log_type(fn)})
@@ -1084,8 +1099,11 @@ def _ensure_tools(job, cfg, tools):
                 "cmd": tmpl.replace("{modules}", mods),
                 "rc": None, "state": "running"}
         job.steps.append(step)
-    _log(job, "\n" + "=" * 78 + "\n### STEP: module load %s  (auto: tools missing: %s)\n"
-         % (mods, ", ".join(missing)) + "=" * 78 + "\n")
+        num = len(job.steps)
+        step["num"] = num
+    _log(job, "\n" + "=" * 78 + "\n### STEP %d: module load %s  (auto: tools missing: %s)\n"
+         % (num, mods, ", ".join(missing)) + "=" * 78 + "\n")
+    _console_step(num, "module load %s" % mods, "start", os.getcwd(), step["cmd"])
     res = load_modules(mods)
     _log(job, "module load applied %s env vars\n" % res.get("applied_vars"))
     if res.get("stderr"):
@@ -1093,6 +1111,7 @@ def _ensure_tools(job, cfg, tools):
     still = [t for t in tools if not shutil.which(_bin_for(cfg, t))]
     step["state"] = "done" if not still else "failed"
     step["rc"] = 0 if not still else 1
+    _console_step(num, "module load %s" % mods, "end", rc=step["rc"])
     if still:
         raise RuntimeError(
             "after 'module load %s', still not found: %s. Check the module name, "
@@ -2148,7 +2167,9 @@ function renderSearchRows(){
       '<td style="white-space:nowrap">'+fmtSize(r.size)+'</td>'+
       '<td class="muted" style="font-size:12px">'+esc(r.dir)+'</td>'+
       '<td style="white-space:nowrap"><button class="sec" style="padding:3px 9px" data-a="pre">use</button> '+
-      '<button class="sec" style="padding:3px 9px" data-a="view">view</button></td>';
+      '<button class="sec" style="padding:3px 9px" data-a="view">view</button> '+
+      '<button class="sec" style="padding:3px 9px" data-a="copy">copy</button></td>';
+    tr.querySelector('[data-a=copy]').onclick=(e)=>copyText(r.path,e.target);
     tr.querySelector('[data-a=pre]').onclick=()=>{$('#prefillpath').value=r.path;$('#prefillbtn').click();
       $('#searchpanel').classList.add('hidden');};
     tr.querySelector('[data-a=view]').onclick=()=>{
@@ -2218,10 +2239,18 @@ async function pollJob(jid){
   const cls=st==='done'?'good':(st==='failed'?'bad':'warn');
   $('#jobstate').className='pill '+cls;$('#jobstate').textContent=st;
   renderProgress(d,st);
-  $('#steps').innerHTML=(d.steps||[]).map(s=>{
+  $('#steps').innerHTML=(d.steps||[]).map((s,i)=>{
     const c=s.state==='done'?'good':(s.state==='failed'?'bad':'warn');
-    return '<div style="margin:3px 0"><span class="pill '+c+'">'+esc(s.state)+'</span> '+
-      esc(s.name)+(s.rc!=null?' <span class="muted">rc='+s.rc+'</span>':'')+
+    const active=s.state==='running';
+    const box='margin:7px 0;padding:9px 12px;border-radius:6px;'+
+      (active
+        ? 'border:3px solid var(--acc);background:var(--acc-light);box-shadow:0 2px 8px rgba(0,82,204,.25);'
+        : 'border:1px solid var(--line);background:var(--panel);');
+    return '<div style="'+box+'">'+
+      '<b style="font-size:15px">'+(i+1)+'.</b> '+
+      (active?'<span class="spinner"></span>':'')+
+      '<span class="pill '+c+'">'+esc(s.state)+'</span> '+
+      '<b>'+esc(s.name)+'</b>'+(s.rc!=null?' <span class="muted">rc='+s.rc+'</span>':'')+
       '<br><code style="font-size:11px">'+esc(s.cmd)+'</code></div>';
   }).join('');
   $('#joblog').textContent=d.log||'';
