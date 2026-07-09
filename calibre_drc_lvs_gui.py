@@ -2397,11 +2397,29 @@ def main():
     print("=" * 66)
     sys.stdout.flush()
     if args.open:
-        try:
-            import webbrowser
-            webbrowser.open(url)
-        except Exception:
-            pass
+        if not os.environ.get("DISPLAY"):
+            print("   (--open: no DISPLAY on this host -- open the URL above yourself,\n"
+                  "    e.g. from your laptop after:  ssh -L %d:127.0.0.1:%d you@host)"
+                  % (actual_port, actual_port))
+        else:
+            # Launch the browser with its stderr sent to /dev/null so a broken/
+            # remote browser (XPCOMGlueLoad, deprecated xdg-open, etc.) can't spam
+            # this console. If it doesn't appear, the URL above still works.
+            try:
+                import webbrowser
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                saved = os.dup(2)
+                os.dup2(devnull, 2)
+                try:
+                    webbrowser.open(url)
+                finally:
+                    os.dup2(saved, 2)
+                    os.close(devnull)
+                    os.close(saved)
+            except Exception:
+                pass
+            print("   (if no browser opened, just paste the URL above into one)")
+    sys.stdout.flush()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
