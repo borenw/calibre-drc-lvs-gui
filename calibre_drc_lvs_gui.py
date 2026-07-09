@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 28      # incremental build number, shown top-right in the GUI
+APP_REVISION = 29      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -506,7 +506,7 @@ class Job(object):
         log = ""
         try:
             if os.path.isfile(self.log_path):
-                with open(self.log_path, "r", errors="replace") as f:
+                with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(0, os.SEEK_END)
                     size = f.tell()
                     f.seek(max(0, size - log_tail_bytes))
@@ -539,7 +539,7 @@ _JOB_COUNTER = [0]
 
 
 def _log(job, msg):
-    with open(job.log_path, "a") as f:
+    with open(job.log_path, "a", encoding="utf-8", errors="replace") as f:
         f.write(msg)
 
 
@@ -636,7 +636,7 @@ def _run_step(job, name, cmd_list, cwd):
     hb.start()
     tail = []                             # keep last ~50 output lines for on-fail dump
     try:
-        with open(job.log_path, "a") as lf:
+        with open(job.log_path, "a", encoding="utf-8", errors="replace") as lf:
             for line in iter(proc.stdout.readline, ""):
                 lf.write(line)
                 lf.flush()
@@ -1191,7 +1191,7 @@ def _dbg(msg):
     try:
         line = "[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
         if RUNS_BASE:
-            with open(os.path.join(RUNS_BASE, "gui_debug.log"), "a") as f:
+            with open(os.path.join(RUNS_BASE, "gui_debug.log"), "a", encoding="utf-8", errors="replace") as f:
                 f.write(line)
     except Exception:
         pass
@@ -2861,8 +2861,26 @@ async function initStartup(){          // --log paths passed on the command line
 #  main
 # --------------------------------------------------------------------------- #
 
+def _force_utf8_console():
+    """Make stdout/stderr tolerate non-ASCII (Calibre output under a C/POSIX
+    locale would otherwise raise UnicodeEncodeError writing the banners/logs)."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name)
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")   # Python 3.7+
+        except Exception:
+            try:
+                import io
+                setattr(sys, stream_name,
+                        io.TextIOWrapper(stream.buffer, encoding="utf-8",
+                                         errors="replace", line_buffering=True))
+            except Exception:
+                pass
+
+
 def main():
     global CONFIG, CONFIG_PATH, RUNS_BASE
+    _force_utf8_console()
     ap = argparse.ArgumentParser(description="Calibre DRC/LVS browser GUI")
     ap.add_argument("--port", type=int, default=8899)
     ap.add_argument("--host", default="127.0.0.1")
