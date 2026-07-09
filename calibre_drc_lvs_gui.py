@@ -50,7 +50,7 @@ from urllib.parse import urlparse, parse_qs
 #  All site/PDK-specific values default to blank or to an environment variable,
 #  and are meant to be filled in via the Config tab (persisted to a local
 #  <config>.json) or via env vars -- nothing about a particular site or PDK is
-#  baked into this file. See config.example.json for a worked TSMC-180 setup.
+#  baked into this file. See config.example.json for a worked example.
 # --------------------------------------------------------------------------- #
 
 def _env(name, default=""):
