@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 27      # incremental build number, shown top-right in the GUI
+APP_REVISION = 28      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -634,11 +634,15 @@ def _run_step(job, name, cmd_list, cwd):
                 pass
     hb = threading.Thread(target=_heartbeat, daemon=True)
     hb.start()
+    tail = []                             # keep last ~50 output lines for on-fail dump
     try:
         with open(job.log_path, "a") as lf:
             for line in iter(proc.stdout.readline, ""):
                 lf.write(line)
                 lf.flush()
+                tail.append(line)
+                if len(tail) > 50:
+                    del tail[0]
             proc.stdout.close()
         rc = proc.wait()
     finally:
@@ -648,6 +652,15 @@ def _run_step(job, name, cmd_list, cwd):
     step["state"] = "done" if rc == 0 else "failed"
     _log(job, "\n### STEP %d %s finished rc=%d\n" % (num, name, rc))
     _console_step(num, name, "end", rc=rc)
+    if rc != 0:                           # surface the tool's own error on the console
+        sys.stdout.write("-E- ----- last output of '%s' (rc=%d) -----\n" % (name, rc))
+        for ln in tail:
+            sys.stdout.write("-E- %s" % (ln if ln.endswith("\n") else ln + "\n"))
+        sys.stdout.write("-E- ----- full log: %s -----\n" % job.log_path)
+        # also echo any strmout/calibre side log(s) in the run dir
+        for extra in sorted(globmod.glob(os.path.join(cwd, "*.log"))):
+            sys.stdout.write("-E- side log: %s\n" % extra)
+        sys.stdout.flush()
     return rc
 
 
