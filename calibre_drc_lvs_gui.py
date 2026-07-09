@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 20      # incremental build number, shown top-right in the GUI
+APP_REVISION = 21      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1636,12 +1636,17 @@ class Handler(BaseHTTPRequestHandler):
         lib = body.get("lib")
         cell = body.get("cell")
         view = body.get("view")
-        if tool not in ("drc", "lvs") or not (lib and cell and view):
-            return self._send_json({"error": "need tool(drc|lvs), lib, cell, view"}, 400)
+        existing_gds = body.get("existing_gds", "").strip()
+        if tool not in ("drc", "lvs") or not cell:
+            return self._send_json({"error": "need tool(drc|lvs) and cell"}, 400)
+        if not existing_gds and not (lib and view):
+            return self._send_json(
+                {"error": "need lib and view (or provide an existing GDS)"}, 400)
         with CONFIG_LOCK:
             cfg_snap = dict(CONFIG)
         meta = {
-            "tool": tool, "lib": lib, "cell": cell, "view": view,
+            "tool": tool, "lib": lib or "existingGDS", "cell": cell,
+            "view": view or "layout",
             "deck": body.get("deck", "").strip() or None,
             "src_net": body.get("src_net", "").strip() or None,
             "existing_gds": body.get("existing_gds", "").strip() or None,
@@ -2201,7 +2206,7 @@ async function easyRun(){
     set('<span class="spinner"></span>step 4/4 &mdash; launching DRC on <b>'+esc(cell)+'</b>&hellip;');
     const d=await jpost('/api/run',body);
     if(d.error){ set('<span class="pill bad">ERROR</span> '+esc(d.error)); return; }
-    set('running <b>'+esc(cell)+'</b> &mdash; progress bar is below &#8595;');
+    set('running <b>DRC</b> on <b>'+esc(cell)+'</b> ('+esc(lib||'existing GDS')+') &mdash; progress below &#8595;');
     startRunUI();
     $('#livepanel').scrollIntoView({behavior:'smooth',block:'start'});
     if(pollTimer)clearInterval(pollTimer);
@@ -2341,7 +2346,8 @@ window.addEventListener('touchmove',()=>{FOLLOW_LOG=false;},{passive:true});
 $('#runbtn').onclick=async()=>{
   const body={tool:currentTool(),lib:$('#lib').value,cell:$('#cell').value,view:$('#view').value,
     deck:$('#deck').value,src_net:$('#srcnet').value,existing_gds:$('#existinggds').value};
-  if(!body.lib||!body.cell||!body.view){$('#runmsg').textContent='pick lib/cell/view';return;}
+  if(!body.cell){$('#runmsg').textContent='pick a cell (or use an existing GDS)';return;}
+  if(!body.existing_gds && (!body.lib||!body.view)){$('#runmsg').textContent='pick lib/cell/view, or set an existing GDS';return;}
   $('#runbtn').disabled=true;$('#runmsg').textContent='launching...';
   const d=await jpost('/api/run',body);
   $('#runbtn').disabled=false;
