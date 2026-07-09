@@ -41,8 +41,20 @@ import sys
 import threading
 import time
 import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+try:
+    # Python 3.7+
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    # Python 3.6 and earlier: build the threaded server ourselves
+    from http.server import HTTPServer
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
 
 # --------------------------------------------------------------------------- #
 #  Configuration
