@@ -157,6 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
+APP_REVISION = 18      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -339,6 +340,10 @@ def parse_lvs_report(text):
     m = re.search(r"^CALIBRE VERSION:\s+(.+)$", text, re.M)
     if m:
         version = m.group(1).strip()
+    date = None
+    m = re.search(r"^CREATION TIME:\s+(.+)$", text, re.M)
+    if m:
+        date = m.group(1).strip()
 
     # Unmatched tallies:  "Total Inst:  646  646  0  0"
     unmatched = {}
@@ -357,6 +362,7 @@ def parse_lvs_report(text):
         "type": "lvs",
         "cell": cell,
         "version": version,
+        "date": date,
         "status": status,
         "unmatched": unmatched,
         "total_unmatched": total_unmatched,
@@ -1379,22 +1385,32 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # quiet
 
+    # Client disconnects mid-response are normal (cancelled polls, favicon, tab
+    # close); swallow the resulting socket errors instead of dumping a traceback.
+    _DISCONNECT = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+    def handle_one_request(self):
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except self._DISCONNECT:
+            self.close_connection = True
+
     # ---- helpers ----
+    def _write(self, body, code, ctype):
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except self._DISCONNECT:
+            self.close_connection = True          # client went away; ignore
+
     def _send_json(self, obj, code=200):
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._write(json.dumps(obj).encode("utf-8"), code, "application/json")
 
     def _send_html(self, text, code=200):
-        body = text.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._write(text.encode("utf-8"), code, "text/html; charset=utf-8")
 
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -1412,8 +1428,10 @@ class Handler(BaseHTTPRequestHandler):
         path = u.path
         q = parse_qs(u.query)
         try:
+            if path == "/favicon.ico":
+                return self._write(b"", 204, "image/x-icon")   # no favicon; skip 404
             if path == "/" or path == "/index.html":
-                return self._send_html(INDEX_HTML)
+                return self._send_html(INDEX_HTML.replace("__REV__", str(APP_REVISION)))
             if path == "/api/config":
                 with CONFIG_LOCK:
                     return self._send_json(dict(CONFIG))
@@ -1475,6 +1493,8 @@ class Handler(BaseHTTPRequestHandler):
                     res["text"] = res["text"][:400000] + "\n...[truncated]..."
                 return self._send_json(res)
             return self._send_json({"error": "not found"}, 404)
+        except self._DISCONNECT:
+            self.close_connection = True          # client closed mid-request
         except Exception as e:
             return self._send_json({"error": str(e),
                                     "trace": traceback.format_exc()}, 500)
@@ -1502,6 +1522,8 @@ class Handler(BaseHTTPRequestHandler):
                     save_config(CONFIG_PATH, CONFIG)
                     return self._send_json({"ok": True, "config": dict(CONFIG)})
             return self._send_json({"error": "not found"}, 404)
+        except self._DISCONNECT:
+            self.close_connection = True          # client closed mid-request
         except Exception as e:
             return self._send_json({"error": str(e),
                                     "trace": traceback.format_exc()}, 500)
@@ -1629,6 +1651,7 @@ INDEX_HTML = r"""<!doctype html>
 <header>
   <h1>Calibre&nbsp;DRC&nbsp;/&nbsp;LVS</h1>
   <span class="sub">runs in your launching shell &mdash; env inherited &bull; <span id="cdslabel"></span></span>
+  <span style="margin-left:auto;font-weight:700;font-size:13px;background:rgba(255,255,255,.20);padding:5px 13px;border-radius:14px;white-space:nowrap">rev __REV__</span>
 </header>
 <div class="tabs">
   <div class="tab active" data-tab="run">Run</div>
@@ -2302,8 +2325,10 @@ function statusPill(r){
 function renderResult(r){
   if(!r)return '';
   if(r.type==='error')return '<div class="pill bad">'+esc(r.error)+'</div>';
-  let h='<div style="margin-bottom:8px">'+statusPill(r)+' <span class="muted">'+esc(r.cell||'')+
-        (r.version?(' &bull; '+esc(r.version)):'')+'</span></div>';
+  const ver=r.version?esc(r.version.split(/\s+/)[0]):'';   // strip Calibre build date
+  let h='<div style="margin-bottom:8px">'+statusPill(r)+' <b>'+esc(r.cell||'')+'</b>'+
+        (r.date?(' <span class="muted">&bull; run '+esc(r.date)+'</span>'):'')+
+        (ver?(' <span class="muted">&bull; Calibre '+ver+'</span>'):'')+'</div>';
   if(r.type==='drc'){
     h+='<div class="kv"><div>Rules checked</div><div>'+r.total_rules+'</div>'+
        '<div>Rules violated</div><div>'+r.violated_rules+'</div>'+
