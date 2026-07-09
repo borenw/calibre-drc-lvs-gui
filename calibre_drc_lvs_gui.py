@@ -2229,8 +2229,34 @@ def main():
     RUNS_BASE = os.path.abspath(args.base)
     os.makedirs(RUNS_BASE, exist_ok=True)
 
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
-    url = "http://%s:%d/" % (args.host, args.port)
+    # Bind, auto-hopping to a free port if the preferred one is taken.
+    httpd = None
+    for port in range(args.port, args.port + 20):
+        try:
+            httpd = ThreadingHTTPServer((args.host, port), Handler)
+            break
+        except OSError as e:
+            if getattr(e, "errno", None) in (98, 48):        # EADDRINUSE (Linux/macOS)
+                continue
+            sys.stderr.write(
+                "\nERROR: could not bind %s:%d -> %s\n"
+                "  - if you passed a hostname, use --host 127.0.0.1\n"
+                "  - for a permission error, pick a port above 1024 (--port 9100)\n\n"
+                % (args.host, port, e))
+            raise SystemExit(1)
+    if httpd is None:
+        sys.stderr.write(
+            "\nERROR: ports %d-%d on %s are all in use.\n"
+            "  A previous instance is probably still running. Either:\n"
+            "    - just open the URL that instance already printed, or\n"
+            "    - stop it:   pkill -f calibre_drc_lvs_gui.py\n"
+            "    - or use another port:   python3 %s --port 9100 --open\n\n"
+            % (args.port, args.port + 19, args.host, os.path.basename(sys.argv[0])))
+        raise SystemExit(1)
+    actual_port = httpd.server_address[1]
+    if actual_port != args.port:
+        print("(port %d busy -> using %d)" % (args.port, actual_port))
+    url = "http://%s:%d/" % (args.host, actual_port)
     print("=" * 66)
     print(" Calibre DRC/LVS GUI")
     print("   URL       : %s" % url)
@@ -2242,6 +2268,7 @@ def main():
     print("   NOTE: Calibre/strmout inherit THIS shell's environment.")
     print("   Ctrl-C to stop.")
     print("=" * 66)
+    sys.stdout.flush()
     if args.open:
         try:
             import webbrowser
