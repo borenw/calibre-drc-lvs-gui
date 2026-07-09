@@ -218,7 +218,9 @@ def parse_cds_lib(cds_path, _seen=None):
                     if not os.path.isabs(p):
                         p = os.path.join(base, p)
                     libs.setdefault(name, os.path.normpath(p))
-                elif key == "INCLUDE" and len(parts) >= 2:
+                elif key in ("INCLUDE", "SOFTINCLUDE") and len(parts) >= 2:
+                    # SOFTINCLUDE is like INCLUDE but silently ignores a missing
+                    # file -- parse_cds_lib already no-ops on a nonexistent path.
                     inc = os.path.expanduser(parts[1])
                     inc = os.path.expandvars(inc)
                     if not os.path.isabs(inc):
