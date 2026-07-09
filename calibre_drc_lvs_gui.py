@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 23      # incremental build number, shown top-right in the GUI
+APP_REVISION = 24      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1320,7 +1320,12 @@ def run_job(job):
         # --- 3. write runset + launch calibre ---
         phase("Generate runset + run Calibre %s (the long step)" % tool.upper())
         if tool == "drc":
-            deck = job.meta.get("deck") or latest_deck("drc") or cfg["drc_deck"]
+            _ex, _gl, _cf = job.meta.get("deck"), latest_deck("drc"), cfg["drc_deck"]
+            sys.stdout.write("   deck resolution: explicit=%r glob-latest=%r config.drc_deck=%r\n"
+                             "                    glob pattern=%r\n" %
+                             (_ex, _gl, _cf, cfg.get("drc_deck_glob")))
+            sys.stdout.flush()
+            deck = _ex or _gl or _cf
             _require_deck(deck, "DRC")
             _artifact("deck", deck)
             runfile = _write_drc_runset(run_dir, cell, gds, deck, cfg.get("drc_extra_svrf", ""))
