@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 22      # incremental build number, shown top-right in the GUI
+APP_REVISION = 23      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -563,6 +563,18 @@ def _human_size(n):
             return "%.0f%s" % (n, u)
         n /= 1024.0
     return "%.1fTB" % n
+
+
+def _artifact(label, path):
+    """Print a step's output file with full path, timestamp and size."""
+    try:
+        st = os.stat(path)
+        sys.stdout.write("   -> %-14s %s   (%s, %s)\n" % (
+            label + ":", path, _human_size(st.st_size),
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))))
+    except OSError:
+        sys.stdout.write("   -> %-14s %s   (NOT FOUND)\n" % (label + ":", path))
+    sys.stdout.flush()
 
 
 def _console_step(num, name, state, cwd=None, cmd=None, rc=None):
@@ -1250,6 +1262,9 @@ def run_job(job):
         phase("Check environment (calibre/strmout on PATH; module-load if needed)")
         needed = ["calibre"] + ([] if job.meta.get("existing_gds") else ["strmout"])
         _ensure_tools(job, cfg, needed)
+        for t in needed:
+            sys.stdout.write("   -> %-14s %s\n" % (t + ":", shutil.which(_bin_for(cfg, t)) or "NOT FOUND"))
+        sys.stdout.flush()
 
         gds = "%s.calibre.db" % cell
         gds_abs = os.path.join(run_dir, gds)
@@ -1280,6 +1295,7 @@ def run_job(job):
                 raise RuntimeError("strmout failed (rc=%d) -- see log" % rc)
             if not os.path.isfile(gds_abs):
                 raise RuntimeError("strmout reported ok but %s not found" % gds)
+        _artifact("GDS", gds_abs if os.path.isabs(gds_abs) else os.path.join(run_dir, gds_abs))
 
         # --- 2. optional source-netlist generation for LVS ---
         src_net = None
@@ -1306,7 +1322,9 @@ def run_job(job):
         if tool == "drc":
             deck = job.meta.get("deck") or latest_deck("drc") or cfg["drc_deck"]
             _require_deck(deck, "DRC")
+            _artifact("deck", deck)
             runfile = _write_drc_runset(run_dir, cell, gds, deck, cfg.get("drc_extra_svrf", ""))
+            _artifact("runset", runfile)
             cmd = _fill(cfg["drc_cmd"], {"calibre_bin": cfg["calibre_bin"],
                                         "runfile": os.path.basename(runfile)})
             rc = _run_step(job, "calibre DRC", cmd, run_dir)
@@ -1314,13 +1332,17 @@ def run_job(job):
         else:
             deck = job.meta.get("deck") or latest_deck("lvs") or cfg["lvs_deck"]
             _require_deck(deck, "LVS")
+            _artifact("deck", deck)
+            _artifact("source net", src_net)
             runfile = _write_lvs_runset(run_dir, cell, gds, src_net, deck,
                                         cfg.get("lvs_extra_svrf", ""))
+            _artifact("runset", runfile)
             cmd = _fill(cfg["lvs_cmd"], {"calibre_bin": cfg["calibre_bin"],
                                         "spiceout": "%s.sp" % cell,
                                         "runfile": os.path.basename(runfile)})
             rc = _run_step(job, "calibre LVS", cmd, run_dir)
             result_file = os.path.join(run_dir, "%s.lvs.report" % cell)
+        _artifact("result", result_file)
 
         # --- 4. parse result ---
         phase("Parse results")
