@@ -140,6 +140,29 @@ by the History and Compare tabs.
 - Siemens Calibre (`calibre`) and, for OA stream-out, Cadence Virtuoso (`strmout`)
 - A browser on the same host (or via SSH port-forward / X)
 
+## Troubleshooting
+
+The console prints numbered `===== STEP N =====` phase banners, the exact command
+per step (`------ command used for X ------`), a 5-second heartbeat, and errors as
+`-E-` lines. The current build shows **top-right in the GUI** (`rev N`).
+
+| Symptom | Cause & fix |
+|---------|-------------|
+| `ImportError: ThreadingHTTPServer` | Python < 3.7. Run with `python3` (works on 3.5+ now); check `python3 --version`. |
+| `-E- No DRC rule deck configured` / `no deck matched glob` | The deck path isn't set/valid **on this host**. The tool now auto-detects it from your existing runsets/logs; if none, set `drc_deck` + `drc_deck_glob` (and `lvs_deck`) in the **Config** tab. Find it with `find / -iname "<DECK_NAME>*" 2>/dev/null`. Site/PDK paths differ per host. |
+| `strmout: command not found` | `strmout` ships with **Cadence Virtuoso**, not Calibre. Set `modules` to include your Cadence module, e.g. `calibre cadence/ic618`, or `module load` both before launching. |
+| `INCL1 … problem with access/file open` | The `INCLUDE`d deck isn't readable here — wrong path/mount, or you're not in the PDK unix group (`ls -l <deck>; id -nG`). |
+| `GMD unable to load shared library` (strmout) | Cadence env issue on that host (`LD_LIBRARY_PATH` / version mismatch). Bypass it: use **Advanced → existing GDS** or the **Existing runsets** panel to run on a `.calibre.db` directly (skips stream-out). |
+| Log search "stalled" / very slow | A search root is on a slow/stalled NFS mount. Each root now has a per-root timeout (abandoned + reported), but narrow **Config → `sim_roots`** to your fast log dir for speed. |
+| Browser errors on `--open` (`XPCOMGlueLoad`, `gio`, `PNG…`) | A broken/remote browser. Run **without `--open`** and open the URL yourself, or forward it: `ssh -L 8899:127.0.0.1:8899 you@host`. |
+| `server_bind` / address in use | The port is busy — the tool now auto-hops to the next free port and prints it. |
+| Config "save error" | The config file isn't writable from your launch dir. Edit `calibre_gui_config.json` directly, or launch where you can write. |
+| Updated but GUI still shows old `rev` | `raw.githubusercontent.com` is CDN-cached ~5 min. Use the API fetch in [Updating](#updating). |
+
+**Per-host config:** nothing site-specific is baked in. Each machine keeps its own
+`calibre_gui_config.json` (gitignored) — set `cds_lib`, `layermap`, decks, and
+`modules` for that host once via the Config tab.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
