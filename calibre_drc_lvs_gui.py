@@ -135,6 +135,9 @@ DEFAULT_CONFIG = {
     # discover_run_dirs: also auto-add run directories parsed from Calibre
     # Interactive state (~/.cgidrcdb, ~/.cgilvsdb, and *Runset* files -> *RunDir).
     "discover_run_dirs": "yes",
+    # Easy button: skip designs whose result-log filename contains any of these
+    # (space/comma separated) when auto-picking -- e.g. the slow top-level chip.
+    "easy_skip_cells": "chipTop chip_top",
     "sim_user": "",
     "sim_roots": ("/sim/{user}\n"
                   "/sim/{user}/calibre\n"
@@ -1787,7 +1790,8 @@ INDEX_HTML = r"""<!doctype html>
   <div class="panel">
     <h2>Compare two results</h2>
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
-      <button class="bigbtn" id="cmpeasybtn">&#9889;&nbsp;Easy compare &mdash; 2 latest logs</button>
+      <button class="gobtn" id="cmpeasybtn">GO</button>
+      <span class="muted" style="font-size:12px;max-width:420px"><b>Easy compare</b> &mdash; auto-fill &amp; compare the 2 most recent result logs.</span>
       <span id="cmpmsg" class="muted" style="font-size:12px"></span>
     </div>
     <div class="row">
@@ -1808,7 +1812,8 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
     </div>
-    <div class="flexbtn"><button id="cmpbtn">Compare</button></div>
+    <div class="flexbtn" style="gap:14px"><button class="gobtn" id="cmpbtn">GO</button>
+      <span class="muted" style="font-size:12px">Compare the A / B selected above.</span></div>
   </div>
   <div id="cmpout"></div>
 </section>
@@ -2033,9 +2038,19 @@ async function easyRun(){
         esc(slow)+'</b> &mdash; continuing with '+s.count+' logs found so far. '+
         '(Trim <b>sim_roots</b> in Config to speed this up.)';
     }
-    // prefer a .drc.summary (has clean cell header); fall back to .drc.results
-    const drc=(s.results||[]).find(r=>/\.drc\.summary$/.test(r.name))
-           || (s.results||[]).find(r=>r.type==='drc' && /\.drc\.(summary|results)$/.test(r.name));
+    // skip slow top-level designs (e.g. chipTop) when auto-picking
+    let skip=[]; try{const c=await jget('/api/config');
+      skip=(c.easy_skip_cells||'').split(/[,\s]+/).filter(Boolean).map(x=>x.toLowerCase());}catch(e){}
+    const skipHit=n=>skip.some(x=>n.toLowerCase().indexOf(x)>=0);
+    const isDrc=r=>r.type==='drc' && /\.drc\.(summary|results)$/.test(r.name);
+    const isSum=r=>/\.drc\.summary$/.test(r.name);
+    // prefer: newest non-skipped .drc.summary -> non-skipped .drc.* -> any (fallback)
+    const drc=(s.results||[]).find(r=>isSum(r)&&!skipHit(r.name))
+           || (s.results||[]).find(r=>isDrc(r)&&!skipHit(r.name))
+           || (s.results||[]).find(r=>isSum(r))
+           || (s.results||[]).find(r=>isDrc(r));
+    if(drc && skip.length && skipHit(drc.name))
+      set('<span class="pill warn">only top-level (skipped) DRC logs found</span> using <b>'+esc(drc.name)+'</b>&hellip;');
     if(!drc){
       await showDebugTail($('#easymsg'),
         '<span class="pill warn">no previous DRC log found</span> in your search roots'+
@@ -2431,11 +2446,18 @@ function renderCompare(d){
     '<div><b>'+laB.tag+'</b> '+statusPill(d.b)+'<div class="muted" style="font-size:11px">'+esc(d.b_path)+'</div></div></div></div>';
   if(d.drc_diff){
     const dd=d.drc_diff;
-    h+='<div class="panel"><h2>DRC rule diff &nbsp;<span class="muted">total '+laA.tag+'='+dd.total_a+' &rarr; '+laB.tag+'='+dd.total_b+'</span></h2>';
-    if(!dd.rows.length){h+='<div class="muted">no differing / non-zero rules</div>';}
+    const changed=(dd.rows||[]).filter(r=>r.status!=='same');
+    const identical=changed.length===0;
+    h+='<div class="panel" style="border:2px solid '+(identical?'var(--good)':'var(--bad)')+'">'+
+       '<h2>DRC rule diff &nbsp;<span class="muted">total '+laA.tag+'='+dd.total_a+' &rarr; '+laB.tag+'='+dd.total_b+'</span></h2>';
+    h+='<div style="margin-bottom:10px">'+(identical
+      ? '<span class="pill good" style="font-size:14px;padding:6px 16px">&#10003; MATCH &mdash; identical DRC results</span>'
+      : '<span class="pill bad" style="font-size:14px;padding:6px 16px">&#10007; DIFFERENT &mdash; '+changed.length+' rule(s) changed</span>')+'</div>';
+    if(!dd.rows.length){h+='<div class="muted">no violations in either run</div>';}
     else{h+='<table><thead><tr><th>Rule</th><th>A<br><span class="muted" style="font-weight:400;font-size:11px">'+laA.short+'</span></th>'+
       '<th>B<br><span class="muted" style="font-weight:400;font-size:11px">'+laB.short+'</span></th><th>&Delta;</th><th>Status</th></tr></thead><tbody>';
-      dd.rows.forEach(r=>{h+='<tr><td>'+esc(r.rule)+'</td><td>'+(r.a==null?'&mdash;':r.a)+
+      const BG={improved:'rgba(0,135,90,.10)',worse:'rgba(222,53,11,.10)',only_a:'rgba(255,139,0,.10)',only_b:'rgba(0,82,204,.08)'};
+      dd.rows.forEach(r=>{h+='<tr style="background:'+(BG[r.status]||'')+'"><td>'+esc(r.rule)+'</td><td>'+(r.a==null?'&mdash;':r.a)+
         '</td><td>'+(r.b==null?'&mdash;':r.b)+'</td><td>'+(r.delta>0?'+':'')+r.delta+
         '</td><td class="status-'+r.status+'">'+r.status+'</td></tr>';});
       h+='</tbody></table>';}
@@ -2476,6 +2498,7 @@ const CFG_LABELS={
   module_load_cmd:'module-load command template ({modules})',
   auto_load_modules:'auto module-load on run (yes/no)',
   discover_run_dirs:'auto-find run dirs from Calibre runsets (yes/no)',
+  easy_skip_cells:'Easy: skip these designs when auto-picking (e.g. chipTop)',
   sim_user:'sim user for log search (blank = login name)',
   sim_roots:'log-search roots ({user} expands)',
   drc_extra_svrf:'extra DRC SVRF lines',lvs_extra_svrf:'extra LVS SVRF lines'};
