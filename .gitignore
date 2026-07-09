@@ -1,0 +1,18 @@
+# Local, site-specific config (contains your paths / module names)
+calibre_gui_config.json
+*.local.json
+
+# Run outputs and registry
+calibre_runs/
+gui_debug.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+*~
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy to calibre_gui_config.json and edit for your site/PDK. Every value can also be set via the in-browser Config tab or an environment variable (CDS_LIB, LAYERMAP, DRC_DECK, EDA_MODULES, ...). Paths below are placeholders.",
+
+  "calibre_bin": "calibre",
+  "strmout_bin": "strmout",
+
+  "cds_lib": "/path/to/your/project/cds.lib",
+  "techlib": "your_tech_library_name",
+  "layermap": "/path/to/pdk/tech/stream.layermap",
+
+  "drc_deck": "/path/to/pdk/drc/DECK_NAME",
+  "drc_deck_glob": "/path/to/pdk/drc/DECK_PREFIX.*",
+  "lvs_deck": "/path/to/pdk/lvs/calibre.lvs",
+  "lvs_deck_glob": "/path/to/pdk/lvs/calibre.lvs*",
+
+  "modules": "calibre cadence/ic618",
+  "auto_load_modules": "yes",
+
+  "sim_user": "",
+  "sim_roots": "/sim/{user}\n~/sim\n~/simulation\n./calibre_runs"
+}
