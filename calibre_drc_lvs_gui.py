@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 25      # incremental build number, shown top-right in the GUI
+APP_REVISION = 26      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -601,9 +601,11 @@ def _run_step(job, name, cmd_list, cwd):
     _log(job, "=" * 78 + "\n")
     _console_step(num, name, "start", cwd, step["cmd"])
     try:
+        # decode tool output as UTF-8 with replacement so a stray non-ASCII byte
+        # (e.g. under a C/POSIX locale) can't crash the reader with a decode error
         proc = subprocess.Popen(cmd_list, cwd=cwd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                universal_newlines=True, bufsize=1,
+                                stderr=subprocess.STDOUT, bufsize=1,
+                                encoding="utf-8", errors="replace",
                                 env=os.environ)  # inherit the launching shell's env
     except FileNotFoundError as e:
         _log(job, "!! executable not found: %s\n" % e)
@@ -1857,6 +1859,13 @@ INDEX_HTML = r"""<!doctype html>
  .progfill.bad{background:var(--bad)} .progfill.good{background:var(--good)}
  th.sortable{cursor:pointer;user-select:none} th.sortable:hover{color:var(--acc)}
  th.sortable .arrow{opacity:.5;font-size:10px}
+ .combowrap{display:flex;gap:4px;position:relative}
+ .combobtn{padding:8px 11px;flex:0 0 auto;font-size:12px}
+ .combomenu{position:absolute;top:calc(100% + 2px);left:0;right:0;z-index:60;background:var(--panel);
+            border:1px solid var(--line);border-radius:6px;max-height:260px;overflow:auto;display:none;
+            box-shadow:0 6px 18px rgba(9,30,66,.18)}
+ .comboitem{padding:7px 11px;cursor:pointer;font-size:13px}
+ .comboitem:hover{background:var(--acc-lighter)}
  /* big bright call-to-action button */
  .bigbtn{font-size:17px;padding:15px 34px;font-weight:700;border-radius:9px;letter-spacing:.02em;
          color:#fff;border:0;cursor:pointer;
@@ -2133,6 +2142,30 @@ let KNOWN_LIBS=new Set();
 function fillList(id,items){
   const dl=$('#'+id);dl.innerHTML='';
   items.forEach(v=>{const o=document.createElement('option');o.value=v;dl.appendChild(o);});
+}
+// give a datalist <input> an explicit dropdown button (click to see & filter all
+// options) while keeping free-text typing. Works in every browser.
+function attachCombo(inputId,listId){
+  const inp=$('#'+inputId); if(!inp||inp.dataset.combo)return; inp.dataset.combo='1';
+  const wrap=document.createElement('div'); wrap.className='combowrap';
+  inp.parentNode.insertBefore(wrap,inp); wrap.appendChild(inp);
+  const btn=document.createElement('button'); btn.type='button'; btn.className='sec combobtn';
+  btn.textContent='▼'; wrap.appendChild(btn);
+  const menu=document.createElement('div'); menu.className='combomenu'; wrap.appendChild(menu);
+  const opts=()=>[...$('#'+listId).options].map(o=>o.value);
+  function show(){
+    const q=inp.value.toLowerCase();
+    const items=opts().filter(v=>v.toLowerCase().indexOf(q)>=0);
+    menu.innerHTML=items.length?items.map(v=>'<div class="comboitem">'+esc(v)+'</div>').join('')
+      :'<div class="comboitem muted">no matches</div>';
+    menu.querySelectorAll('.comboitem').forEach(el=>el.onclick=()=>{
+      if(el.classList.contains('muted'))return;
+      inp.value=el.textContent; menu.style.display='none'; inp.dispatchEvent(new Event('change'));});
+    menu.style.display='block';
+  }
+  btn.onclick=()=>{ menu.style.display==='block'?menu.style.display='none':show(); };
+  inp.addEventListener('input',()=>{ if(menu.style.display==='block')show(); });
+  document.addEventListener('click',e=>{ if(!wrap.contains(e.target))menu.style.display='none'; });
 }
 async function loadLibs(){
   const d=await jget('/api/libs');
@@ -2786,6 +2819,7 @@ $('#savecfg').onclick=async()=>{
 };
 
 // init
+attachCombo('lib','liblist'); attachCombo('cell','celllist'); attachCombo('view','viewlist');
 loadLibs();
 checkEnv();
 loadDecks();
