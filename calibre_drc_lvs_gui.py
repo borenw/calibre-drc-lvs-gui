@@ -604,6 +604,115 @@ def _guess_log_type(name):
     return "log"
 
 
+_RF_LAYOUT_PATH = re.compile(r'^LAYOUT\s+PATH\s+"?([^"\n]+?)"?\s*$', re.M | re.I)
+_RF_LAYOUT_PRIM = re.compile(r'^LAYOUT\s+PRIMARY\s+"?([^"\n]+?)"?\s*$', re.M | re.I)
+_RF_SOURCE_PATH = re.compile(r'^SOURCE\s+PATH\s+"?([^"\n]+?)"?\s*$', re.M | re.I)
+_RF_SOURCE_PRIM = re.compile(r'^SOURCE\s+PRIMARY\s+"?([^"\n]+?)"?\s*$', re.M | re.I)
+_RF_INCLUDE = re.compile(r'^INCLUDE\s+"?([^"\n]+?)"?\s*$', re.M | re.I)
+_RF_DRC_DB = re.compile(r'^DRC\s+RESULTS\s+DATABASE\s+"?([^"\n]+?)"?', re.M | re.I)
+_RF_LVS_REP = re.compile(r'^LVS\s+REPORT\s+"?([^"\n]+?)"?', re.M | re.I)
+
+RULE_FILE_PATTERNS = ["_*.drc_", "_*.lvs_", "_calibre.drc_", "_calibre.lvs_",
+                      "*.drc.rule", "*.lvs.rule", "_*_"]
+
+
+def _parse_rule_file(path):
+    """Parse a Calibre SVRF rule file (runset / _calibre.lvs_ / *.drc.rule) into
+    its DRC/LVS settings. Returns None if it doesn't look like an SVRF file."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            txt = f.read(200000)
+    except Exception:
+        return None
+    prim = _RF_LAYOUT_PRIM.search(txt)
+    inc = _RF_INCLUDE.search(txt)
+    if not (prim or inc):
+        return None                                   # not an SVRF rule file
+    g = lambda r: (r.search(txt).group(1).strip() if r.search(txt) else "")
+    is_lvs = bool(_RF_SOURCE_PRIM.search(txt) or _RF_SOURCE_PATH.search(txt)) \
+        or ".lvs" in os.path.basename(path).lower()
+    return {"file": path, "tool": "lvs" if is_lvs else "drc",
+            "cell": g(_RF_LAYOUT_PRIM), "layout_path": g(_RF_LAYOUT_PATH),
+            "source_path": g(_RF_SOURCE_PATH), "source_primary": g(_RF_SOURCE_PRIM),
+            "deck": g(_RF_INCLUDE), "result": g(_RF_DRC_DB) or g(_RF_LVS_REP)}
+
+
+def scan_rule_files(max_seconds=6.0, max_depth=3, limit=80):
+    """Find existing Calibre rule files (runsets) under the launch dir, the run
+    registry, and discovered run dirs -- so a prior DRC/LVS setup (layout, cell,
+    source, deck) can be reused directly."""
+    with CONFIG_LOCK:
+        cfg = dict(CONFIG)
+    roots = [os.getcwd()]
+    if RUNS_BASE:
+        roots.append(RUNS_BASE)
+    try:
+        roots += discover_run_dirs(cfg)
+    except Exception:
+        pass
+    seen, uroots = set(), []
+    for r in roots:
+        ap = os.path.abspath(r)
+        if ap not in seen and os.path.isdir(ap):
+            seen.add(ap)
+            uroots.append(ap)
+    deadline = time.time() + max_seconds
+    found, seen_files, timed_out = [], set(), False
+    for root in uroots:
+        base = root.rstrip("/").count("/")
+        for dirpath, dirs, files in os.walk(root):
+            if time.time() > deadline:
+                timed_out = True
+                break
+            if dirpath.rstrip("/").count("/") - base >= max_depth:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if not d.startswith(".")
+                       and d not in ("svdb", "__pycache__", ".git")]
+            for fn in files:
+                low = fn.lower()
+                if not any(fnmatch.fnmatch(fn, p) for p in RULE_FILE_PATTERNS):
+                    continue
+                if fn.startswith("__") or "rcx" in low or "pex" in low or "erc" in low:
+                    continue                          # skip extraction/meta, not DRC/LVS
+                fp = os.path.join(dirpath, fn)
+                if fp in seen_files:
+                    continue
+                seen_files.add(fp)
+                d = _parse_rule_file(fp)
+                if not d or not d["cell"]:            # need a real LAYOUT PRIMARY
+                    continue
+                if d["deck"] and d["deck"].lower().endswith((".rcx", ".pex")):
+                    continue                          # extraction deck, not DRC/LVS
+                rd = os.path.dirname(fp)
+                for k in ("layout_path", "source_path"):
+                    v = d.get(k)
+                    if v and not os.path.isabs(v):
+                        d[k] = os.path.normpath(os.path.join(rd, v))
+                try:
+                    d["mtime"] = os.path.getmtime(fp)
+                except OSError:
+                    d["mtime"] = 0
+                d["layout_exists"] = bool(d["layout_path"]) and os.path.isfile(d["layout_path"])
+                d["deck_exists"] = bool(d["deck"]) and os.path.isfile(d["deck"])
+                found.append(d)
+                if len(found) >= limit:
+                    break
+            if len(found) >= limit:
+                break
+        if timed_out or len(found) >= limit:
+            break
+    found.sort(key=lambda x: x["mtime"], reverse=True)
+    dedup, seenkey = [], set()
+    for d in found:                                   # keep newest per tool+cell+deck
+        k = (d["tool"], d["cell"], d["deck"])
+        if k in seenkey:
+            continue
+        seenkey.add(k)
+        dedup.append(d)
+    return {"count": len(dedup), "timed_out": timed_out, "rulefiles": dedup[:limit]}
+
+
 def recent_layouts(cfg=None, limit=12, max_seconds=6.0, views=("layout",)):
     """Scan the WRITABLE cds.lib libraries for the most recently modified layout
     cellviews (i.e. the design you were just editing). Read-only PDK/other-user
@@ -1325,6 +1434,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(list_decks(q.get("kind", ["drc"])[0]))
             if path == "/api/recent_layouts":
                 return self._send_json(recent_layouts())
+            if path == "/api/rulefiles":
+                return self._send_json(scan_rule_files())
             if path == "/api/searchlogs":
                 return self._send_json(search_logs(
                     user=q.get("user", [""])[0],
@@ -1567,6 +1678,17 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <div class="panel" id="rulepanel">
+    <h2>Existing runsets found &mdash; reuse a DRC/LVS setup
+      <button class="sec" id="rulerefresh" style="float:right;padding:4px 10px">refresh</button></h2>
+    <div id="rulemsg" class="muted" style="font-size:12px;margin-bottom:6px"></div>
+    <div style="max-height:240px;overflow:auto">
+      <table id="ruletable"><thead><tr>
+        <th>Modified</th><th>Tool</th><th>Cell</th><th>Deck (INCLUDE)</th><th>Layout</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
   <div class="panel">
     <h2>Select design</h2>
     <div class="radio" style="margin-bottom:8px">
@@ -1786,6 +1908,45 @@ $('#prefillbtn').onclick=async()=>{
   $('#prefillmsg').innerHTML=esc0(msg);
 };
 function esc0(s){return s;} // msg already safe-ish; keep simple
+
+// ---- existing runsets (reuse a prior DRC/LVS setup) ----
+$('#rulerefresh').onclick=loadRuleFiles;
+async function loadRuleFiles(){
+  $('#rulemsg').innerHTML='<span class="spinner"></span>scanning launch dir &amp; run dirs for runsets&hellip;';
+  let d;try{ d=await jgetT('/api/rulefiles',20000); }
+  catch(e){ $('#rulemsg').innerHTML='<span class="pill warn">scan stalled</span>'; return; }
+  const tb=$('#ruletable tbody');tb.innerHTML='';
+  (d.rulefiles||[]).forEach(r=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td style="white-space:nowrap">'+esc(fmtRel(r.mtime))+'</td>'+
+      '<td><span class="pill '+(r.tool==='lvs'?'warn':'good')+'">'+esc(r.tool.toUpperCase())+'</span></td>'+
+      '<td>'+esc(r.cell)+'</td>'+
+      '<td class="muted" style="font-size:12px">'+(r.deck?esc(r.deck.split('/').pop())+
+        (r.deck_exists?'':' <span class="pill bad">missing</span>'):'&mdash;')+'</td>'+
+      '<td>'+(r.layout_exists?'<span class="pill good">GDS</span>':'<span class="muted">no gds</span>')+'</td>'+
+      '<td><button class="sec" style="padding:3px 10px">use</button></td>';
+    tr.querySelector('button').onclick=()=>useRuleFile(r);
+    tb.appendChild(tr);
+  });
+  $('#rulemsg').innerHTML=(d.rulefiles||[]).length
+    ? (d.count+' runset(s) found near the launch directory'+(d.timed_out?' <span class="pill warn">scan capped</span>':''))
+    : 'no existing runsets found near the launch directory (launch python where your *.drc.rule / _calibre.lvs_ live)';
+  if(!(d.rulefiles||[]).length)tb.innerHTML='<tr><td colspan=6 class="muted">none found</td></tr>';
+}
+function useRuleFile(r){
+  $$('input[name=tool]').forEach(x=>x.checked=(x.value===r.tool));
+  $('#lvsonly').classList.toggle('hidden',r.tool!=='lvs');
+  $('#cell').value=r.cell;
+  if(r.layout_exists){ $('#existinggds').value=r.layout_path;
+    const det=$('#existinggds').closest('details'); if(det)det.open=true; }
+  $('#deck').value = r.deck_exists ? r.deck : '';
+  $('#deck').dataset.auto = r.deck_exists ? '0' : '1';   // stale deck -> auto-latest
+  if(r.tool==='lvs' && r.source_path) $('#srcnet').value=r.source_path;
+  loadCells(); loadDecks();
+  $('#runmsg').innerHTML='reusing runset for <b>'+esc(r.cell)+'</b> ('+r.tool.toUpperCase()+')'+
+    (r.deck_exists?'':' &mdash; original deck missing, using latest deck')+' &mdash; click Run';
+  document.getElementById('runbtn').scrollIntoView({behavior:'smooth',block:'center'});
+}
 
 // ---- recently edited layouts (suggested DRC/LVS) ----
 function fmtRel(t){const s=(Date.now()/1000)-t;
@@ -2310,6 +2471,7 @@ $('#savecfg').onclick=async()=>{
 loadLibs();
 checkEnv();
 loadDecks();
+loadRuleFiles();
 loadRecent();
 initStartup();
 async function initStartup(){          // --log paths passed on the command line
