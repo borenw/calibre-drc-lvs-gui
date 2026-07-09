@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 26      # incremental build number, shown top-right in the GUI
+APP_REVISION = 27      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -2015,7 +2015,7 @@ INDEX_HTML = r"""<!doctype html>
       <button class="sec" id="stopbtn" style="float:right;padding:4px 14px;color:var(--bad);border-color:var(--bad);display:none">&#9632; Stop</button></h2>
     <div id="progwrap" style="margin:2px 0 14px">
       <div class="progbar"><div id="progfill" class="progfill"></div></div>
-      <div id="progtext" class="muted" style="font-size:12px;margin-top:5px"></div>
+      <div id="progtext" style="font-size:16px;margin-top:7px;color:var(--fg)"></div>
     </div>
     <div id="steps"></div>
     <details open><summary>Live log</summary><pre id="joblog">...</pre></details>
@@ -2515,21 +2515,23 @@ function fmtDur(s){s=Math.round(s||0);const m=Math.floor(s/60),ss=s%60;
 function renderProgress(d,st){
   const fill=$('#progfill'),txt=$('#progtext');
   fill.classList.remove('indet','bad','good');
+  const big='font-size:20px;font-weight:700';
   if(st==='done'){
     fill.classList.add('good');fill.style.width='100%';
-    txt.innerHTML='&#10003; completed in '+fmtDur(d.elapsed);
+    txt.innerHTML='&#10003; completed in <span style="'+big+';color:var(--good)">'+fmtDur(d.elapsed)+'</span>';
   }else if(st==='failed'){
     fill.classList.add('bad');fill.style.width='100%';
-    txt.innerHTML='&#10007; failed after '+fmtDur(d.elapsed);
+    txt.innerHTML='&#10007; failed after <span style="'+big+';color:var(--bad)">'+fmtDur(d.elapsed)+'</span>';
   }else if(d.progress!=null){
     fill.style.width=d.progress+'%';
-    txt.innerHTML='<span class="spinner"></span>'+d.progress+'% &bull; elapsed '+fmtDur(d.elapsed)+
-      (d.eta?(' &bull; ~'+fmtDur(d.eta)+' remaining'):'')+
-      ' <span class="muted">(est. from prior run)</span>';
+    txt.innerHTML='<span class="spinner"></span><span style="'+big+';color:var(--acc)">'+d.progress+'%</span>'+
+      ' &bull; elapsed <span style="'+big+'">'+fmtDur(d.elapsed)+'</span>'+
+      (d.eta?(' &bull; <span style="'+big+';color:var(--acc)">~'+fmtDur(d.eta)+'</span> remaining'):'')+
+      ' <span class="muted" style="font-size:12px">(est. from prior run)</span>';
   }else{
     fill.classList.add('indet');fill.style.width='35%';
-    txt.innerHTML='<span class="spinner"></span>running&hellip; elapsed '+fmtDur(d.elapsed)+
-      ' <span class="muted">(no prior run for ETA)</span>';
+    txt.innerHTML='<span class="spinner"></span>running&hellip; elapsed <span style="'+big+'">'+fmtDur(d.elapsed)+'</span>'+
+      ' <span class="muted" style="font-size:12px">(no prior run for ETA)</span>';
   }
 }
 let CURRENT_JOB=null;
@@ -2598,9 +2600,9 @@ function renderResult(r){
   if(!r)return '';
   if(r.type==='error')return '<div class="pill bad">'+esc(r.error)+'</div>';
   const ver=r.version?esc(r.version.split(/\s+/)[0]):'';   // strip Calibre build date
-  let h='<div style="margin-bottom:8px">'+statusPill(r)+' <b>'+esc(r.cell||'')+'</b>'+
-        (r.date?(' <span class="muted">&bull; run '+esc(r.date)+'</span>'):'')+
-        (ver?(' <span class="muted">&bull; Calibre '+ver+'</span>'):'')+'</div>';
+  let h='<div style="margin-bottom:8px">'+statusPill(r)+' <b style="font-size:16px">'+esc(r.cell||'')+'</b></div>'+
+        (r.date?('<div style="font-size:16px;font-weight:600;margin-bottom:6px">run: '+esc(r.date)+'</div>'):'')+
+        (ver?('<div class="muted" style="font-size:12px;margin-bottom:6px">Calibre '+ver+'</div>'):'');
   if(r.type==='drc'){
     h+='<div class="kv"><div>Rules checked</div><div>'+r.total_rules+'</div>'+
        '<div>Rules violated</div><div>'+r.violated_rules+'</div>'+
