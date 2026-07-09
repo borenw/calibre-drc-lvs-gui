@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 21      # incremental build number, shown top-right in the GUI
+APP_REVISION = 22      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -969,43 +969,59 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds
         sys.stdout.write("   scanning  %s ...\n" % root)
         sys.stdout.flush()
         t0 = time.time()
-        base = root.rstrip("/").count("/")
-        walker = os.walk(root, onerror=lambda e: _dbg("searchlogs:   walk error %s" % e))
-        for dirpath, dirs, files in walker:
-            if time.time() > deadline:
-                timed_out = True
-                rec["timed_out"] = True
-                _dbg("searchlogs:   TIMEOUT while scanning %s (at %s)" % (root, dirpath))
-                break
-            if dirpath.rstrip("/").count("/") - base >= max_depth:
-                dirs[:] = []
-                continue
-            dirs[:] = [d for d in dirs if not d.startswith(".")
-                       and d not in ("svdb", "__pycache__", ".git")]
-            for fn in files:
-                if any(fnmatch.fnmatch(fn, p) for p in LOG_PATTERNS):
-                    p = os.path.join(dirpath, fn)
-                    try:
-                        stt = os.stat(p)
-                    except OSError:
+        # Walk each root in a worker thread with a per-root time cap, so a single
+        # stalled/NFS root (where os.walk blocks in a syscall) is ABANDONED and we
+        # move on to the next root instead of hanging the whole search.
+        per_root = max(1.0, min(6.0, deadline - time.time()))
+        abandon = threading.Event()
+        rlock = threading.Lock()
+
+        def _walk(root=root, rec=rec):
+            base = root.rstrip("/").count("/")
+            try:
+                for dirpath, dirs, files in os.walk(root, onerror=lambda e: None):
+                    if abandon.is_set():
+                        return
+                    if dirpath.rstrip("/").count("/") - base >= max_depth:
+                        dirs[:] = []
                         continue
-                    if not stat.S_ISREG(stt.st_mode):
-                        continue                      # never list dirs/special files
-                    results.append({"path": p, "name": fn, "dir": dirpath,
-                                    "size": stt.st_size, "mtime": stt.st_mtime,
-                                    "type": _guess_log_type(fn)})
-                    rec["hits"] += 1
-                    if len(results) >= max_results:
-                        break
-            if len(results) >= max_results:
-                break
+                    dirs[:] = [d for d in dirs if not d.startswith(".")
+                               and d not in ("svdb", "__pycache__", ".git")]
+                    for fn in files:
+                        if any(fnmatch.fnmatch(fn, pp) for pp in LOG_PATTERNS):
+                            p = os.path.join(dirpath, fn)
+                            try:
+                                stt = os.stat(p)
+                            except OSError:
+                                continue
+                            if not stat.S_ISREG(stt.st_mode):
+                                continue
+                            with rlock:
+                                results.append({"path": p, "name": fn, "dir": dirpath,
+                                                "size": stt.st_size, "mtime": stt.st_mtime,
+                                                "type": _guess_log_type(fn)})
+                                rec["hits"] += 1
+                                if len(results) >= max_results:
+                                    return
+            except Exception:
+                pass
+
+        th = threading.Thread(target=_walk, daemon=True)
+        th.start()
+        th.join(per_root)
+        if th.is_alive():                 # root too slow -> abandon it, keep going
+            abandon.set()
+            rec["timed_out"] = True
+            timed_out = True
+            _dbg("searchlogs:   ABANDONED slow root %s after %.1fs" % (root, per_root))
         rec["seconds"] = round(time.time() - t0, 2)
         _dbg("searchlogs:   %s -> %d hits in %.2fs%s" %
-             (root, rec["hits"], rec["seconds"], " (TIMED OUT)" if rec["timed_out"] else ""))
+             (root, rec["hits"], rec["seconds"], " (ABANDONED)" if rec["timed_out"] else ""))
         sys.stdout.write("      -> %d logs in %.1fs%s\n" %
-                         (rec["hits"], rec["seconds"], "   *** TIMED OUT ***" if rec["timed_out"] else ""))
+                         (rec["hits"], rec["seconds"],
+                          "   *** SLOW ROOT ABANDONED ***" if rec["timed_out"] else ""))
         sys.stdout.flush()
-        if timed_out or len(results) >= max_results:
+        if len(results) >= max_results or time.time() > deadline:
             break
     results.sort(key=lambda r: r["mtime"], reverse=True)
     _dbg("searchlogs: done -> %d logs, timed_out=%s" % (len(results), timed_out))
@@ -2156,7 +2172,7 @@ async function easyRun(){
     // 2) find latest DRC log (bounded; never hang the button)
     set('<span class="spinner"></span>step 2/4 &mdash; searching for your most recent DRC log (max ~10s)&hellip;');
     let s;
-    try{ s=await jgetT('/api/searchlogs?user='+encodeURIComponent($('#simuser').value.trim()),15000); }
+    try{ s=await jgetT('/api/searchlogs?user='+encodeURIComponent($('#simuser').value.trim()),25000); }
     catch(err){
       await showDebugTail($('#easymsg'),
         '<span class="pill bad">log search stalled</span> a search root is slow or unreachable '+
@@ -2278,7 +2294,7 @@ async function doSearch(){
   const u=encodeURIComponent($('#simuser').value.trim());
   const x=encodeURIComponent($('#simextra').value.trim());
   let d;
-  try{ d=await jgetT('/api/searchlogs?user='+u+'&extra='+x, 20000); }
+  try{ d=await jgetT('/api/searchlogs?user='+u+'&extra='+x, 30000); }
   catch(err){ $('#searchbtn').disabled=false;
     await showDebugTail($('#searchmsg'),'<span class="pill bad">search stalled</span> a root is slow/unreachable &mdash; trim sim_roots in Config. Debug log:');
     return; }
