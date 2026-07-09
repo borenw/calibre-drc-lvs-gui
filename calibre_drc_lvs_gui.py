@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 30      # incremental build number, shown top-right in the GUI
+APP_REVISION = 31      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -192,6 +192,38 @@ def save_config(path, cfg):
 # --------------------------------------------------------------------------- #
 #  cds.lib parsing + OA library scanning
 # --------------------------------------------------------------------------- #
+
+def resolve_cds_lib(cfg=None):
+    """Return an EXISTING cds.lib file path, or '' if none can be found.
+
+    Order: the configured cds_lib (if it's a real file) -> a cds.lib in the launch
+    directory or any parent (how Cadence itself finds it) -> $CDS_LIB / $HOME.
+    Never returns a directory or a blank->cwd artifact."""
+    if cfg is None:
+        with CONFIG_LOCK:
+            cfg = dict(CONFIG)
+    cand = (cfg.get("cds_lib") or "").strip()
+    if cand:
+        cand = os.path.abspath(os.path.expanduser(os.path.expandvars(cand)))
+        if os.path.isfile(cand):
+            return cand
+    # walk up from the launch dir looking for a cds.lib
+    d = os.getcwd()
+    while True:
+        fp = os.path.join(d, "cds.lib")
+        if os.path.isfile(fp):
+            return fp
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    for fp in (os.environ.get("CDS_LIB", ""),
+               os.path.join(os.path.expanduser("~"), "cds.lib")):
+        fp = os.path.abspath(os.path.expanduser(os.path.expandvars(fp))) if fp else ""
+        if fp and os.path.isfile(fp):
+            return fp
+    return ""
+
 
 def parse_cds_lib(cds_path, _seen=None):
     """Return {libname: abspath} from a cds.lib, following INCLUDEs one level deep."""
@@ -421,7 +453,7 @@ def extract_design_from_file(path):
     if out["cell"] and not out["lib"]:
         matches = []
         try:
-            libs = parse_cds_lib(CONFIG["cds_lib"])
+            libs = parse_cds_lib(resolve_cds_lib())
             for name, p in libs.items():
                 if os.path.isdir(os.path.join(p, out["cell"])):
                     matches.append(name)
@@ -887,7 +919,7 @@ def recent_layouts(cfg=None, limit=12, max_seconds=6.0, views=("layout",)):
     if cfg is None:
         with CONFIG_LOCK:
             cfg = dict(CONFIG)
-    libs = parse_cds_lib(cfg.get("cds_lib", ""))
+    libs = parse_cds_lib(resolve_cds_lib(cfg))
     deadline = time.time() + max_seconds
     items, timed_out = [], False
     for lib, libpath in sorted(libs.items()):
@@ -960,7 +992,7 @@ def discover_run_dirs(cfg):
     home = os.path.expanduser("~")
     scan_dirs = {home, os.getcwd()}
     try:
-        for p in parse_cds_lib(cfg.get("cds_lib", "")).values():
+        for p in parse_cds_lib(resolve_cds_lib(cfg)).values():
             scan_dirs.add(p)
     except Exception:
         pass
@@ -1181,6 +1213,57 @@ def _fill(template, mapping):
     return shlex.split(template.format(**mapping))
 
 
+def _drop_valueless_flags(tokens, flags):
+    """Remove a flag (and only the flag) when its value is missing/blank -- i.e.
+    the flag is last, or the next token is another flag. Keeps blank techlib/
+    layermap from corrupting the strmout command (e.g. '-techLib -layerMap ...')."""
+    out, i, n = [], 0, len(tokens)
+    while i < n:
+        t = tokens[i]
+        if t in flags:
+            nxt = tokens[i + 1] if i + 1 < n else None
+            if nxt is None or nxt.startswith("-"):
+                i += 1
+                continue                       # drop the value-less flag
+        out.append(t)
+        i += 1
+    return out
+
+
+_STRM_TECHLIB_RE = re.compile(r"^\s*techLib\s+(\S+)", re.M)
+_STRM_LAYERMAP_RE = re.compile(r"^\s*layerMap\s+(\S+)", re.M)
+
+
+def discover_strmout_opts():
+    """Read techLib / layerMap from existing strmout logs (most-recent first), for
+    hosts where they aren't configured. Only returns a layerMap that exists here."""
+    techlib, layermap = "", ""
+    try:
+        results = search_logs(max_seconds=6.0).get("results", [])
+    except Exception:
+        results = []
+    for r in results:                          # already sorted newest-first
+        if not (fnmatch.fnmatch(r["name"], "strmOut*.log")
+                or fnmatch.fnmatch(r["name"], "strmout*.log")):
+            continue
+        try:
+            with open(r["path"], "r", encoding="utf-8", errors="replace") as f:
+                txt = f.read(12000)
+        except OSError:
+            continue
+        if not techlib:
+            m = _STRM_TECHLIB_RE.search(txt)
+            if m:
+                techlib = m.group(1)
+        if not layermap:
+            m = _STRM_LAYERMAP_RE.search(txt)
+            if m and os.path.isfile(m.group(1)):
+                layermap = m.group(1)
+        if techlib and layermap:
+            break
+    return {"techlib": techlib, "layermap": layermap}
+
+
 # --------------------------------------------------------------------------- #
 #  Environment / module auto-loading
 # --------------------------------------------------------------------------- #
@@ -1354,16 +1437,37 @@ def run_job(job):
             gds_abs = src
             gds = src
         else:
-            # give strmout a cds.lib in the run dir that INCLUDEs the configured one
+            # resolve a real cds.lib (config -> launch dir/parents -> $HOME)
+            cds = resolve_cds_lib(cfg)
+            if not cds:
+                raise RuntimeError(
+                    "cds.lib not found. Set 'cds_lib' in Config, or launch the GUI "
+                    "from your project directory (the one containing cds.lib).")
+            _artifact("cds.lib", cds)
+            # resolve techLib / layerMap: config, else auto-detect from strmout logs
+            techlib = (cfg.get("techlib") or "").strip()
+            layermap = (cfg.get("layermap") or "").strip()
+            if not techlib or not layermap:
+                opt = discover_strmout_opts()
+                if not techlib and opt["techlib"]:
+                    techlib = opt["techlib"]
+                    sys.stdout.write("   techLib auto-detected from strmout log: %s\n" % techlib)
+                if not layermap and opt["layermap"]:
+                    layermap = opt["layermap"]
+                    sys.stdout.write("   layerMap auto-detected from strmout log: %s\n" % layermap)
+                sys.stdout.flush()
+            # give strmout a cds.lib in the run dir that INCLUDEs the real one
             local_cds = os.path.join(run_dir, "cds.lib")
-            with open(local_cds, "w") as f:
-                f.write('INCLUDE "%s"\n' % os.path.abspath(os.path.expanduser(cfg["cds_lib"])))
+            with open(local_cds, "w", encoding="utf-8") as f:
+                f.write('INCLUDE "%s"\n' % cds)
             mapping = {
                 "strmout_bin": cfg["strmout_bin"], "lib": lib, "cell": cell,
                 "view": view, "gds": gds, "strmlog": "strmout_%s.log" % cell,
-                "techlib": cfg["techlib"], "layermap": cfg["layermap"],
+                "techlib": techlib, "layermap": layermap,
             }
-            cmd = _fill(cfg["strmout_cmd"], mapping)
+            # drop -techLib / -layerMap if still blank so the command isn't corrupted
+            cmd = _drop_valueless_flags(_fill(cfg["strmout_cmd"], mapping),
+                                        {"-techLib", "-layerMap", "-layermap"})
             rc = _run_step(job, "strmout (OA->GDS)", cmd, run_dir)
             if rc != 0:
                 raise RuntimeError("strmout failed (rc=%d) -- see log" % rc)
@@ -1663,20 +1767,20 @@ class Handler(BaseHTTPRequestHandler):
                 with CONFIG_LOCK:
                     return self._send_json(dict(CONFIG))
             if path == "/api/libs":
-                libs = parse_cds_lib(CONFIG["cds_lib"])
+                libs = parse_cds_lib(resolve_cds_lib())
                 items = [{"name": n, "path": p, "exists": os.path.isdir(p)}
                          for n, p in sorted(libs.items())]
-                return self._send_json({"cds_lib": CONFIG["cds_lib"], "libs": items})
+                return self._send_json({"cds_lib": resolve_cds_lib(), "libs": items})
             if path == "/api/cells":
                 lib = q.get("lib", [""])[0]
-                libs = parse_cds_lib(CONFIG["cds_lib"])
+                libs = parse_cds_lib(resolve_cds_lib())
                 if lib not in libs:
                     return self._send_json({"error": "unknown lib %r" % lib}, 400)
                 return self._send_json({"cells": list_cells(libs[lib])})
             if path == "/api/views":
                 lib = q.get("lib", [""])[0]
                 cell = q.get("cell", [""])[0]
-                libs = parse_cds_lib(CONFIG["cds_lib"])
+                libs = parse_cds_lib(resolve_cds_lib())
                 if lib not in libs:
                     return self._send_json({"error": "unknown lib"}, 400)
                 return self._send_json({"views": list_views(libs[lib], cell)})
@@ -2942,7 +3046,7 @@ def main():
     print("   URL       : %s" % url)
     print("   runs dir  : %s" % RUNS_BASE)
     print("   config    : %s" % CONFIG_PATH)
-    print("   cds.lib   : %s" % CONFIG["cds_lib"])
+    print("   cds.lib   : %s" % (resolve_cds_lib() or "(none found -- set cds_lib or launch from your project dir)"))
     if STARTUP_LOGS:
         print("   --log     : %s" % ", ".join(STARTUP_LOGS))
     print("   NOTE: Calibre/strmout inherit THIS shell's environment.")
