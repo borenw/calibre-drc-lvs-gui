@@ -51,6 +51,7 @@ or with environment variables (`CDS_LIB`, `LAYERMAP`, `DRC_DECK`, `DRC_DECK_GLOB
 | `--base DIR` | `./calibre_runs` | where run outputs + the run registry live |
 | `--config F` | `./calibre_gui_config.json` | config file (persisted from the Config tab) |
 | `--open` | off | try to open a browser |
+| `--log PATH` | — | prefill the Run tab from an existing result log on startup; pass twice to also preset the Compare tab (A/B) |
 
 ## Features
 
@@ -62,8 +63,11 @@ or with environment variables (`CDS_LIB`, `LAYERMAP`, `DRC_DECK`, `DRC_DECK_GLOB
 - **Prefill from a log** — paste a `.drc.summary` / `.lvs.report` / runset / strmout
   log and it fills tool + lib + cell + view (inferring the library from `cds.lib`
   when the log doesn't name it).
-- **Log search** — scan `/sim/<user>` and other configurable roots for result logs,
-  with sortable columns and a spinner.
+- **Log search** — scan configurable roots for result logs, with sortable columns
+  and a spinner. **Auto-discovers run directories** by parsing Calibre Interactive
+  state (`~/.cgidrcdb`, `~/.cgilvsdb`, and `*Runset*` files → `*RunDir`), so it finds
+  your logs wherever you actually ran them without configuring paths. Bounded by an
+  8 s wall-clock budget so a slow/NFS root can't hang the UI.
 - **Deck auto-discovery** — globs your deck directory and auto-selects the **newest
   revision** (so you never point at a stale, deleted deck version).
 - **Environment auto-load** — if `strmout` / `calibre` aren't on `PATH`, it runs

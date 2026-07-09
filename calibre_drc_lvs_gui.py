@@ -112,6 +112,9 @@ DEFAULT_CONFIG = {
 
     # Log search. {user} is expanded to sim_user (or the login name if blank).
     # Roots are searched (bounded depth) for Calibre result logs.
+    # discover_run_dirs: also auto-add run directories parsed from Calibre
+    # Interactive state (~/.cgidrcdb, ~/.cgilvsdb, and *Runset* files -> *RunDir).
+    "discover_run_dirs": "yes",
     "sim_user": "",
     "sim_roots": ("/sim/{user}\n"
                   "/sim/{user}/calibre\n"
@@ -130,6 +133,7 @@ CONFIG_LOCK = threading.Lock()
 CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
+STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -574,6 +578,70 @@ def _guess_log_type(name):
     return "log"
 
 
+_RUNDIR_RE = re.compile(r"^\*(?:drc|lvs|pex|cmn)\w*RunDir:\s*(\S+)", re.M)
+
+
+def _parse_rundirs(path):
+    """Return (rundirs, referenced_runset_files) parsed from a runset / cgi db."""
+    try:
+        with open(path, "r", errors="replace") as f:
+            txt = f.read()
+    except Exception:
+        return [], []
+    dirs = _RUNDIR_RE.findall(txt)
+    refs = []
+    for line in txt.splitlines():
+        line = line.strip()
+        # ~/.cgidrcdb lists runset file paths (one per line); follow them
+        if line.startswith("/") and " " not in line and os.path.isfile(line):
+            refs.append(line)
+    return dirs, refs
+
+
+def discover_run_dirs(cfg):
+    """Auto-discover Calibre run directories from Interactive state files
+    (~/.cgidrcdb, ~/.cgilvsdb, and *Runset*/*runset* files in the home dir,
+    the cds.lib library dirs, and the CWD) by reading their *RunDir keys."""
+    home = os.path.expanduser("~")
+    scan_dirs = {home, os.getcwd()}
+    try:
+        for p in parse_cds_lib(cfg.get("cds_lib", "")).values():
+            scan_dirs.add(p)
+    except Exception:
+        pass
+    files = []
+    for d in scan_dirs:
+        for name in (".cgidrcdb", ".cgilvsdb"):
+            fp = os.path.join(d, name)
+            if os.path.isfile(fp):
+                files.append(fp)
+        try:
+            for fn in os.listdir(d):
+                if "runset" in fn.lower():
+                    files.append(os.path.join(d, fn))
+        except OSError:
+            pass
+
+    found, seen = set(), set()
+    queue = list(dict.fromkeys(files))
+    i, cap = 0, 500                       # bounded so a weird file can't loop forever
+    while i < len(queue) and i < cap:
+        fp = queue[i]
+        i += 1
+        if fp in seen or not os.path.isfile(fp):
+            continue
+        seen.add(fp)
+        dirs, refs = _parse_rundirs(fp)
+        for dpath in dirs:
+            dpath = os.path.expanduser(os.path.expandvars(dpath))
+            if os.path.isdir(dpath):
+                found.add(os.path.abspath(dpath))
+        for r in refs:
+            if r not in seen:
+                queue.append(r)
+    return sorted(found)
+
+
 def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds=8.0):
     """Search /sim/<user> and other simulation roots for Calibre logs.
 
@@ -594,6 +662,16 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds
             e = e.strip()
             if e:
                 roots.append(os.path.expanduser(os.path.expandvars(e.replace("{user}", user))))
+    # auto-discovered Calibre run directories (searched first -- most likely hits)
+    discovered = set()
+    if str(cfg.get("discover_run_dirs", "yes")).strip().lower() in ("1", "yes", "true", "on"):
+        try:
+            discovered = set(discover_run_dirs(cfg))
+        except Exception as e:
+            _dbg("discover_run_dirs error: %s" % e)
+        if discovered:
+            _dbg("discover_run_dirs: %s" % sorted(discovered))
+            roots = sorted(discovered) + roots
     # de-dupe, keep order
     seen, uroots = set(), []
     for r in roots:
@@ -607,7 +685,8 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds
     results, scanned, timed_out = [], [], False
     for root in uroots:
         exists = os.path.isdir(root)
-        rec = {"root": root, "exists": exists, "hits": 0, "seconds": 0.0, "timed_out": False}
+        rec = {"root": root, "exists": exists, "hits": 0, "seconds": 0.0,
+               "timed_out": False, "discovered": root in discovered}
         scanned.append(rec)
         if not exists:
             _dbg("searchlogs:   skip (absent) %s" % root)
@@ -1138,6 +1217,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(job.snapshot())
             if path == "/api/envcheck":
                 return self._send_json(env_status())
+            if path == "/api/startup":
+                return self._send_json({"logs": STARTUP_LOGS})
             if path == "/api/debuglog":
                 dl = os.path.join(RUNS_BASE, "gui_debug.log")
                 txt = ""
@@ -1722,10 +1803,11 @@ async function doSearch(){
     return; }
   finally{ $('#searchbtn').disabled=false; }
   if($('#simuser').value.trim()==='' && d.user)$('#simuser').value=d.user;
-  const found=(d.roots||[]).filter(r=>r.exists).map(r=>r.root);
+  const found=(d.roots||[]).filter(r=>r.exists);
   const miss=(d.roots||[]).filter(r=>!r.exists).map(r=>r.root);
   $('#searchroots').innerHTML='searched (user=<b>'+esc(d.user)+'</b>): '+
-    found.map(r=>'<span style="color:var(--good)">'+esc(r)+'</span>').join(' , ')+
+    found.map(r=>'<span style="color:var(--good)">'+esc(r.root)+
+      (r.discovered?' <span class="pill muted" style="padding:0 6px">auto</span>':'')+'</span>').join(' , ')+
     (miss.length?' &nbsp;| not present: '+miss.map(esc).join(' , '):'');
   $('#searchmsg').innerHTML=d.count+' log(s) found'+(d.truncated?' (truncated)':'')+
     (d.timed_out?' <span class="pill warn">timed out &mdash; partial; trim sim_roots</span>':'');
@@ -2048,6 +2130,7 @@ const CFG_LABELS={
   modules:'modules to auto-load if tools missing',
   module_load_cmd:'module-load command template ({modules})',
   auto_load_modules:'auto module-load on run (yes/no)',
+  discover_run_dirs:'auto-find run dirs from Calibre runsets (yes/no)',
   sim_user:'sim user for log search (blank = login name)',
   sim_roots:'log-search roots ({user} expands)',
   drc_extra_svrf:'extra DRC SVRF lines',lvs_extra_svrf:'extra LVS SVRF lines'};
@@ -2074,6 +2157,18 @@ $('#savecfg').onclick=async()=>{
 loadLibs();
 checkEnv();
 loadDecks();
+initStartup();
+async function initStartup(){          // --log paths passed on the command line
+  let d;try{ d=await jget('/api/startup'); }catch(e){ return; }
+  const logs=(d&&d.logs)||[];
+  if(!logs.length)return;
+  $('#prefillpath').value=logs[0];
+  $('#prefillbtn').click();            // prefill Run tab from the first log
+  if(logs.length>=2){                  // preset Compare with the first two
+    $('#cmpPathA').value=logs[0]; $('#cmpPathB').value=logs[1];
+    $('#prefillmsg').innerHTML+=' &bull; 2 logs on command line &mdash; Compare tab preset';
+  }
+}
 </script>
 </body></html>
 """
@@ -2092,7 +2187,13 @@ def main():
                     help="base dir for run outputs")
     ap.add_argument("--config", default=os.path.abspath("./calibre_gui_config.json"))
     ap.add_argument("--open", action="store_true", help="open a browser")
+    ap.add_argument("--log", action="append", metavar="PATH", default=[],
+                    help="existing result log (.drc.summary/.lvs.report/...) to "
+                         "prefill on startup; repeat once more to preset a compare")
     args = ap.parse_args()
+
+    global STARTUP_LOGS
+    STARTUP_LOGS = [os.path.abspath(os.path.expanduser(p)) for p in (args.log or [])]
 
     CONFIG_PATH = os.path.abspath(args.config)
     CONFIG = load_config(CONFIG_PATH)
@@ -2109,6 +2210,8 @@ def main():
     print("   runs dir  : %s" % RUNS_BASE)
     print("   config    : %s" % CONFIG_PATH)
     print("   cds.lib   : %s" % CONFIG["cds_lib"])
+    if STARTUP_LOGS:
+        print("   --log     : %s" % ", ".join(STARTUP_LOGS))
     print("   NOTE: Calibre/strmout inherit THIS shell's environment.")
     print("   Ctrl-C to stop.")
     print("=" * 66)
