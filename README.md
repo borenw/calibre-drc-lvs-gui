@@ -73,7 +73,7 @@ Nothing site-specific is baked into the script. Keys (all editable in the Config
 | Key | Example | Notes |
 |-----|---------|-------|
 | `cds_lib` | `/proj/cds.lib` | `cds.lib` that `DEFINE`s your OA libraries |
-| `techlib` / `layermap` | `tsmc18` / `.../stream.layermap` | stream-out settings |
+| `techlib` / `layermap` | `<tech_lib>` / `.../stream.layermap` | stream-out settings |
 | `drc_deck` / `lvs_deck` | deck file paths | INCLUDEd by the generated runset |
 | `drc_deck_glob` / `lvs_deck_glob` | `.../DECK.*` | newest match auto-selected |
 | `modules` | `calibre cadence/ic618` | auto-`module load`ed when tools are missing |
