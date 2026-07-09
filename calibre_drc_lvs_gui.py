@@ -990,7 +990,9 @@ def compare_results(path_a, path_b):
     b = detect_and_parse(path_b)
     out = {"a": {k: v for k, v in a.items() if k != "text"},
            "b": {k: v for k, v in b.items() if k != "text"},
-           "a_path": path_a, "b_path": path_b}
+           "a_path": path_a, "b_path": path_b,
+           "a_mtime": os.path.getmtime(path_a) if os.path.isfile(path_a) else 0,
+           "b_mtime": os.path.getmtime(path_b) if os.path.isfile(path_b) else 0}
 
     # DRC vs DRC -> per-rule diff
     if a.get("type") == "drc" and b.get("type") == "drc":
@@ -1275,6 +1277,13 @@ INDEX_HTML = r"""<!doctype html>
  .progfill.bad{background:var(--bad)} .progfill.good{background:var(--good)}
  th.sortable{cursor:pointer;user-select:none} th.sortable:hover{color:var(--acc)}
  th.sortable .arrow{opacity:.5;font-size:10px}
+ /* big bright call-to-action button */
+ .bigbtn{font-size:17px;padding:15px 34px;font-weight:700;border-radius:9px;letter-spacing:.02em;
+         color:#fff;border:0;cursor:pointer;
+         background:linear-gradient(135deg,#12c99b 0%,#0a8f6f 100%);
+         box-shadow:0 3px 10px rgba(10,143,111,.38)}
+ .bigbtn:hover{filter:brightness(1.08);box-shadow:0 4px 14px rgba(10,143,111,.5)}
+ .bigbtn:disabled{opacity:.55;cursor:default;filter:none}
 </style></head>
 <body>
 <header>
@@ -1294,7 +1303,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="panel" style="border:2px solid var(--acc)">
     <h2 style="color:var(--acc)">Easy &mdash; one click does everything</h2>
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
-      <button id="easybtn" style="font-size:15px;padding:13px 26px">&#9889;&nbsp;Easy DRC</button>
+      <button id="easybtn" class="bigbtn">&#9889;&nbsp;Easy DRC &mdash; one click</button>
       <span class="muted" style="font-size:12px;max-width:640px">
         Loads the required modules &rarr; finds your most recent DRC log &rarr; re-runs DRC on that
         design with the latest rule deck &rarr; shows a live progress bar with %% and ETA below.</span>
@@ -1395,6 +1404,9 @@ INDEX_HTML = r"""<!doctype html>
   <div class="panel" id="resultpanel" style="display:none;border:2px solid var(--line)">
     <h2>Result &nbsp;<span id="resultpill"></span></h2>
     <div id="resultbody"></div>
+    <div id="resultactions" style="margin-top:14px;display:none">
+      <button class="sec" id="result2compare">Compare this run with previous &#9656;</button>
+    </div>
   </div>
 </section>
 
@@ -1415,6 +1427,10 @@ INDEX_HTML = r"""<!doctype html>
 <section id="tab-compare" class="hidden">
   <div class="panel">
     <h2>Compare two results</h2>
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+      <button class="bigbtn" id="cmpeasybtn">&#9889;&nbsp;Easy compare &mdash; 2 latest logs</button>
+      <span id="cmpmsg" class="muted" style="font-size:12px"></span>
+    </div>
     <div class="row">
       <div>
         <label>Run A (from history)</label><select id="cmpRunA"></select>
@@ -1433,9 +1449,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
     </div>
-    <div class="flexbtn"><button id="cmpbtn">Compare</button>
-      <button class="sec" id="cmpeasybtn">&#9889;&nbsp;Easy compare (2 latest logs)</button>
-      <span id="cmpmsg" class="muted"></span></div>
+    <div class="flexbtn"><button id="cmpbtn">Compare</button></div>
   </div>
   <div id="cmpout"></div>
 </section>
@@ -1774,6 +1788,7 @@ async function pollJob(jid){
     if(d.error) h+='<div class="pill bad" style="margin-top:8px">'+esc(d.error)+'</div>';
     $('#resultbody').innerHTML=h;
     $('#resultpill').innerHTML=d.result?statusPill(d.result):'';
+    $('#resultactions').style.display=(st==='done' && d.result && d.result.type!=='error')?'block':'none';
     if((st==='done'||st==='failed') && !RESULT_SCROLLED){
       RESULT_SCROLLED=true;rp.scrollIntoView({behavior:'smooth',block:'start'});
     }
@@ -1877,6 +1892,17 @@ function copyText(t,btn){
     ta.select();try{document.execCommand('copy');}catch(e){}document.body.removeChild(ta);done();}
 }
 $$('button[data-copy]').forEach(b=>b.onclick=()=>copyText($('#'+b.dataset.copy).value,b));
+// "Compare this run with previous" from the Result section
+$('#result2compare').onclick=async()=>{
+  $$('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelector('.tab[data-tab=compare]').classList.add('active');
+  $$('main>section').forEach(s=>s.classList.add('hidden'));
+  $('#tab-compare').classList.remove('hidden');
+  $('#cmpPathA').value=''; $('#cmpPathB').value='';   // let auto-fill run
+  await loadCmpRuns();                                 // A=latest run, B=sibling
+  $('#cmpbtn').click();
+};
+
 // Easy compare: pick the 2 most recent parseable result logs, label by parsed
 // cell name (add date/time when both are the same cell), fill A/B, and compare.
 $('#cmpeasybtn').onclick=async()=>{
@@ -1908,16 +1934,29 @@ $('#cmpbtn').onclick=async()=>{
   $('#cmpmsg').textContent='';
   $('#cmpout').innerHTML=renderCompare(d);
 };
+function cmpLabel(side,d){
+  const cell=(d[side]&&d[side].cell)||'?';
+  const mt=d[side+'_mtime']||0;
+  const other=(side==='a')?(d.b_mtime||0):(d.a_mtime||0);
+  const when=mt?new Date(mt*1000).toLocaleString():'';
+  const latest=mt && mt>=other;
+  return {cell:cell, when:when, latest:latest,
+    tag:(side==='a'?'A':'B')+' = '+esc(cell)+(when?(' ('+(latest?'latest, ':'')+esc(when)+')'):''),
+    short:esc(cell)+(when?('<br><span class="muted" style="font-weight:400;font-size:11px">'+
+          (latest?'latest, ':'')+esc(when)+'</span>'):'')};
+}
 function renderCompare(d){
   if(d.error)return '<div class="panel"><span class="pill bad">'+esc(d.error)+'</span></div>';
+  const laA=cmpLabel('a',d), laB=cmpLabel('b',d);
   let h='<div class="panel"><h2>Summary</h2><div class="row">'+
-    '<div><b>A</b> '+statusPill(d.a)+'<div class="muted">'+esc(d.a_path)+'</div></div>'+
-    '<div><b>B</b> '+statusPill(d.b)+'<div class="muted">'+esc(d.b_path)+'</div></div></div></div>';
+    '<div><b>'+laA.tag+'</b> '+statusPill(d.a)+'<div class="muted" style="font-size:11px">'+esc(d.a_path)+'</div></div>'+
+    '<div><b>'+laB.tag+'</b> '+statusPill(d.b)+'<div class="muted" style="font-size:11px">'+esc(d.b_path)+'</div></div></div></div>';
   if(d.drc_diff){
     const dd=d.drc_diff;
-    h+='<div class="panel"><h2>DRC rule diff &nbsp;<span class="muted">total A='+dd.total_a+' &rarr; B='+dd.total_b+'</span></h2>';
+    h+='<div class="panel"><h2>DRC rule diff &nbsp;<span class="muted">total '+laA.tag+'='+dd.total_a+' &rarr; '+laB.tag+'='+dd.total_b+'</span></h2>';
     if(!dd.rows.length){h+='<div class="muted">no differing / non-zero rules</div>';}
-    else{h+='<table><thead><tr><th>Rule</th><th>A</th><th>B</th><th>&Delta;</th><th>Status</th></tr></thead><tbody>';
+    else{h+='<table><thead><tr><th>Rule</th><th>A<br><span class="muted" style="font-weight:400;font-size:11px">'+laA.short+'</span></th>'+
+      '<th>B<br><span class="muted" style="font-weight:400;font-size:11px">'+laB.short+'</span></th><th>&Delta;</th><th>Status</th></tr></thead><tbody>';
       dd.rows.forEach(r=>{h+='<tr><td>'+esc(r.rule)+'</td><td>'+(r.a==null?'&mdash;':r.a)+
         '</td><td>'+(r.b==null?'&mdash;':r.b)+'</td><td>'+(r.delta>0?'+':'')+r.delta+
         '</td><td class="status-'+r.status+'">'+r.status+'</td></tr>';});
@@ -1927,10 +1966,10 @@ function renderCompare(d){
   if(d.lvs_diff){
     const l=d.lvs_diff;
     h+='<div class="panel"><h2>LVS diff</h2><div class="kv">'+
-      '<div>Status A</div><div>'+esc(l.status_a)+'</div>'+
-      '<div>Status B</div><div>'+esc(l.status_b)+'</div>'+
-      '<div>Unmatched A</div><div>'+l.unmatched_a+'</div>'+
-      '<div>Unmatched B</div><div>'+l.unmatched_b+'</div>'+
+      '<div>Status &mdash; '+laA.tag+'</div><div>'+esc(l.status_a)+'</div>'+
+      '<div>Status &mdash; '+laB.tag+'</div><div>'+esc(l.status_b)+'</div>'+
+      '<div>Unmatched '+laA.tag+'</div><div>'+l.unmatched_a+'</div>'+
+      '<div>Unmatched '+laB.tag+'</div><div>'+l.unmatched_b+'</div>'+
       '<div>Changed</div><div>'+(l.changed?'<span class="pill warn">YES</span>':'<span class="pill good">no</span>')+'</div>'+
       '</div></div>';
   }

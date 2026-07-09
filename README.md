@@ -5,7 +5,22 @@ runs and comparing results — driven by a tiny local web server so that Calibre
 Cadence tools run **in the same shell environment you launched from** (licenses,
 `PATH`, module setup all inherited).
 
-No Flask, no pip installs — Python 3.6+ standard library only.
+No Flask, no pip installs — Python 3.6+ standard library only. The whole app is a
+**single file**, so installing = downloading that one file.
+
+## Install & run — one command
+
+Copy this (use the 📋 button on the box), paste in your terminal, press Enter:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/borenw/calibre-drc-lvs-gui/main/calibre_drc_lvs_gui.py -o calibre_drc_lvs_gui.py && python3 calibre_drc_lvs_gui.py --open
+```
+
+That's it — it downloads the script and opens the GUI in your browser. Run it from a
+shell where your Calibre/Cadence modules are set up, **or** just click **Load modules**
+in the app once it opens.
+
+<sub>Prefer a helper script? `curl -fsSL https://raw.githubusercontent.com/borenw/calibre-drc-lvs-gui/main/install.sh | bash`</sub>
 
 ## Why a local server (not just an `.html` file)
 
@@ -14,12 +29,12 @@ this script runs a small HTTP server **in your current shell**; the browser talk
 `localhost`, and every `strmout` / `calibre` call is a subprocess that inherits
 `os.environ` verbatim. So there's no new terminal and nothing to re-source.
 
-## Quick start
+## Later runs & configuration
+
+Once downloaded, just:
 
 ```bash
-# From a shell where your EDA tools are set up (or let the GUI module-load them):
-python3 calibre_drc_lvs_gui.py --open
-# then open the printed URL, e.g. http://127.0.0.1:8899/
+python3 calibre_drc_lvs_gui.py --open   # then open the printed http://127.0.0.1:8899/
 ```
 
 First run creates `calibre_gui_config.json` next to the script. Point it at your
