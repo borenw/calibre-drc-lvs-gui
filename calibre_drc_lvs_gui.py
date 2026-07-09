@@ -805,6 +805,26 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds
             "timed_out": timed_out, "results": results}
 
 
+def _require_deck(deck, kind):
+    """Fail early (before Calibre's INCL1) if the rule deck the runset will
+    INCLUDE isn't a readable file on THIS host."""
+    if not deck:
+        raise RuntimeError(
+            "No %s rule deck configured. Set %s_deck / %s_deck_glob in the Config "
+            "tab." % (kind, kind.lower(), kind.lower()))
+    if not os.path.exists(deck):
+        raise RuntimeError(
+            "%s rule deck not found on this host:\n  %s\n"
+            "This path may not be mounted here (you are on a different host). "
+            "Set the correct deck in Config -> %s_deck / %s_deck_glob."
+            % (kind, deck, kind.lower(), kind.lower()))
+    if not os.access(deck, os.R_OK):
+        raise RuntimeError(
+            "%s rule deck exists but is NOT readable by you:\n  %s\n"
+            "You are probably not in the PDK unix group on this host "
+            "(check: `ls -l <deck>` and `id -nG`)." % (kind, deck))
+
+
 def _write_drc_runset(run_dir, cell, gds, deck, extra):
     runfile = os.path.join(run_dir, "%s.drc.rule" % cell)
     with open(runfile, "w") as f:
@@ -1039,6 +1059,7 @@ def run_job(job):
         # --- 3. write runset + launch calibre ---
         if tool == "drc":
             deck = job.meta.get("deck") or latest_deck("drc") or cfg["drc_deck"]
+            _require_deck(deck, "DRC")
             runfile = _write_drc_runset(run_dir, cell, gds, deck, cfg.get("drc_extra_svrf", ""))
             cmd = _fill(cfg["drc_cmd"], {"calibre_bin": cfg["calibre_bin"],
                                         "runfile": os.path.basename(runfile)})
@@ -1046,6 +1067,7 @@ def run_job(job):
             result_file = os.path.join(run_dir, "%s.drc.summary" % cell)
         else:
             deck = job.meta.get("deck") or latest_deck("lvs") or cfg["lvs_deck"]
+            _require_deck(deck, "LVS")
             runfile = _write_lvs_runset(run_dir, cell, gds, src_net, deck,
                                         cfg.get("lvs_extra_svrf", ""))
             cmd = _fill(cfg["lvs_cmd"], {"calibre_bin": cfg["calibre_bin"],
