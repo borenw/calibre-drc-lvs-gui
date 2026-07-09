@@ -527,6 +527,13 @@ def _run_step(job, name, cmd_list, cwd):
     _log(job, "### STEP: %s\n### CMD : %s\n### CWD : %s\n" %
          (name, step["cmd"], cwd))
     _log(job, "=" * 78 + "\n")
+    # Echo a copy/paste-able command to the server console (the shell you
+    # launched from) so you can reproduce/debug the exact call by hand.
+    sys.stdout.write("\n" + "=" * 78 + "\n"
+                     "RUN [%s] -- copy/paste to reproduce in this shell:\n\n"
+                     "  cd %s && \\\n  %s\n\n" % (name, shlex.quote(cwd), step["cmd"])
+                     + "=" * 78 + "\n")
+    sys.stdout.flush()
     try:
         proc = subprocess.Popen(cmd_list, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
@@ -595,6 +602,53 @@ def _guess_log_type(name):
     if "strmout" in n or "strmout" == n[:7]:
         return "strmout"
     return "log"
+
+
+def recent_layouts(cfg=None, limit=12, max_seconds=6.0, views=("layout",)):
+    """Scan the WRITABLE cds.lib libraries for the most recently modified layout
+    cellviews (i.e. the design you were just editing). Read-only PDK/other-user
+    libraries are skipped for speed and relevance. Bounded by max_seconds."""
+    if cfg is None:
+        with CONFIG_LOCK:
+            cfg = dict(CONFIG)
+    libs = parse_cds_lib(cfg.get("cds_lib", ""))
+    deadline = time.time() + max_seconds
+    items, timed_out = [], False
+    for lib, libpath in sorted(libs.items()):
+        if time.time() > deadline:
+            timed_out = True
+            break
+        if not os.path.isdir(libpath) or not os.access(libpath, os.W_OK):
+            continue                                  # skip read-only (PDK/others)
+        try:
+            cells = os.listdir(libpath)
+        except OSError:
+            continue
+        for cell in cells:
+            if cell.startswith(".") or cell == "data.dm":
+                continue
+            cdir = os.path.join(libpath, cell)
+            if not os.path.isdir(cdir):
+                continue
+            for view in views:
+                vdir = os.path.join(cdir, view)
+                if not os.path.isdir(vdir):
+                    continue
+                try:                                  # 1 stat typical (layout.oa)
+                    mt = os.path.getmtime(os.path.join(vdir, "layout.oa"))
+                except OSError:
+                    try:
+                        mt = os.path.getmtime(vdir)
+                    except OSError:
+                        mt = None
+                if mt is not None:
+                    items.append({"lib": lib, "cell": cell, "view": view,
+                                  "mtime": mt, "path": vdir})
+            if time.time() > deadline:
+                timed_out = True
+                break
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return {"count": len(items), "recent": items[:limit], "timed_out": timed_out}
 
 
 _RUNDIR_RE = re.compile(r"^\*(?:drc|lvs|pex|cmn)\w*RunDir:\s*(\S+)", re.M)
@@ -1247,6 +1301,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"path": dl, "text": txt})
             if path == "/api/decks":
                 return self._send_json(list_decks(q.get("kind", ["drc"])[0]))
+            if path == "/api/recent_layouts":
+                return self._send_json(recent_layouts())
             if path == "/api/searchlogs":
                 return self._send_json(search_logs(
                     user=q.get("user", [""])[0],
@@ -1478,6 +1534,17 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <div class="panel" id="recentpanel">
+    <h2>Recently edited layouts &mdash; suggested checks
+      <button class="sec" id="recentrefresh" style="float:right;padding:4px 10px">refresh</button></h2>
+    <div id="recentmsg" class="muted" style="font-size:12px;margin-bottom:6px"></div>
+    <div style="max-height:230px;overflow:auto">
+      <table id="recenttable"><thead><tr>
+        <th>Modified</th><th>Library</th><th>Cell</th><th>View</th><th>Suggested</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
   <div class="panel">
     <h2>Select design</h2>
     <div class="radio" style="margin-bottom:8px">
@@ -1697,6 +1764,43 @@ $('#prefillbtn').onclick=async()=>{
   $('#prefillmsg').innerHTML=esc0(msg);
 };
 function esc0(s){return s;} // msg already safe-ish; keep simple
+
+// ---- recently edited layouts (suggested DRC/LVS) ----
+function fmtRel(t){const s=(Date.now()/1000)-t;
+  if(s<90)return 'just now'; if(s<3600)return Math.round(s/60)+'m ago';
+  if(s<86400)return Math.round(s/3600)+'h ago'; return Math.round(s/86400)+'d ago';}
+$('#recentrefresh').onclick=loadRecent;
+async function loadRecent(){
+  $('#recentmsg').innerHTML='<span class="spinner"></span>scanning your writable OA libraries&hellip;';
+  let d;try{ d=await jgetT('/api/recent_layouts',25000); }
+  catch(e){ $('#recentmsg').innerHTML='<span class="pill warn">scan stalled</span> (large libraries)'; return; }
+  const tb=$('#recenttable tbody');tb.innerHTML='';
+  (d.recent||[]).forEach((r,i)=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td style="white-space:nowrap">'+esc(fmtRel(r.mtime))+'</td>'+
+      '<td>'+esc(r.lib)+'</td><td>'+esc(r.cell)+(i===0?' <span class="pill good">latest</span>':'')+'</td>'+
+      '<td>'+esc(r.view)+'</td>'+
+      '<td style="white-space:nowrap"><button class="sec" data-t="drc" style="padding:3px 10px">DRC</button> '+
+      '<button class="sec" data-t="lvs" style="padding:3px 10px">LVS</button></td>';
+    tr.querySelector('[data-t=drc]').onclick=()=>useDesign('drc',r);
+    tr.querySelector('[data-t=lvs]').onclick=()=>useDesign('lvs',r);
+    tb.appendChild(tr);
+  });
+  const top=(d.recent||[])[0];
+  $('#recentmsg').innerHTML=top
+    ? ('most recently edited: <b>'+esc(top.lib+' / '+top.cell+' / '+top.view)+'</b> ('+fmtRel(top.mtime)+')'+
+       (d.timed_out?' &bull; <span class="pill warn">scan capped &mdash; showing newest found</span>':''))
+    : 'no writable layout libraries found in cds.lib';
+  if(!(d.recent||[]).length)tb.innerHTML='<tr><td colspan=5 class="muted">nothing found</td></tr>';
+}
+function useDesign(tool,r){
+  $$('input[name=tool]').forEach(x=>x.checked=(x.value===tool));
+  $('#lvsonly').classList.toggle('hidden',tool!=='lvs');
+  $('#lib').value=r.lib; $('#cell').value=r.cell; $('#view').value=r.view;
+  loadCells(); loadDecks();
+  $('#runmsg').innerHTML='loaded <b>'+esc(r.lib+' / '+r.cell+' / '+r.view)+'</b> for '+tool.toUpperCase()+' &mdash; click Run';
+  document.getElementById('runbtn').scrollIntoView({behavior:'smooth',block:'center'});
+}
 
 // ---- Easy: one-click do-it-all DRC ----
 $('#easybtn').onclick=easyRun;
@@ -2184,6 +2288,7 @@ $('#savecfg').onclick=async()=>{
 loadLibs();
 checkEnv();
 loadDecks();
+loadRecent();
 initStartup();
 async function initStartup(){          // --log paths passed on the command line
   let d;try{ d=await jget('/api/startup'); }catch(e){ return; }
