@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 19      # incremental build number, shown top-right in the GUI
+APP_REVISION = 20      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -475,7 +475,20 @@ class Job(object):
         self.error = None
         self.started = time.time()
         self.finished = None
+        self.proc = None                 # currently-running subprocess (for Stop)
+        self.stop_requested = False
         self._lock = threading.Lock()
+
+    def stop(self):
+        """Request stop: kill the running subprocess if any."""
+        self.stop_requested = True
+        p = self.proc
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        return p is not None
 
     def snapshot(self, log_tail_bytes=200000):
         with self._lock:
@@ -530,17 +543,36 @@ def _log(job, msg):
         f.write(msg)
 
 
+def _banner(tag, desc):
+    """Big flushed phase separator to the launching terminal."""
+    line = "=" * 72
+    sys.stdout.write("\n%s\n=====  %s  %s\n%s\n" % (line, tag, desc, line))
+    sys.stdout.flush()
+
+
+def _err(msg):
+    """Print an error EDA-style (-E-) to the launching terminal."""
+    for ln in (str(msg).splitlines() or [""]):
+        sys.stdout.write("-E- %s\n" % ln)
+    sys.stdout.flush()
+
+
+def _human_size(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024.0:
+            return "%.0f%s" % (n, u)
+        n /= 1024.0
+    return "%.1fTB" % n
+
+
 def _console_step(num, name, state, cwd=None, cmd=None, rc=None):
-    """Print a numbered, flushed progress line to the launching terminal."""
+    """Print the exact command (copy/paste-able) and its result under a phase."""
     if state == "start":
-        sys.stdout.write(
-            "\n" + "=" * 78 + "\n"
-            " %d. %s   [RUNNING]\n"
-            "    copy/paste to reproduce:  cd %s && \\\n    %s\n"
-            % (num, name, shlex.quote(cwd), cmd) + "=" * 78 + "\n")
+        sys.stdout.write("\n------ command used for %s ------\n"
+                         "  cd %s && %s\n" % (name, shlex.quote(cwd), cmd))
     else:
-        mark = "OK" if rc == 0 else "FAILED"
-        sys.stdout.write(" %d. %s   [%s rc=%s]\n" % (num, name, mark, rc))
+        sys.stdout.write("------ %s: %s (rc=%s) ------\n"
+                         % (name, "OK" if rc == 0 else "FAILED", rc))
     sys.stdout.flush()
 
 
@@ -567,12 +599,37 @@ def _run_step(job, name, cmd_list, cwd):
         step["rc"] = 127
         _console_step(num, name, "end", rc=127)
         return 127
-    with open(job.log_path, "a") as lf:
-        for line in iter(proc.stdout.readline, ""):
-            lf.write(line)
-            lf.flush()
-        proc.stdout.close()
-    rc = proc.wait()
+    job.proc = proc                       # expose for the Stop button
+    # heartbeat: every 5s print the newest-changing file + size in the run dir
+    stop_hb = threading.Event()
+
+    def _heartbeat():
+        while not stop_hb.wait(5.0):
+            try:
+                newest, nsize, nmt = None, 0, 0
+                for e in os.scandir(cwd):
+                    if e.is_file():
+                        st = e.stat()
+                        if st.st_mtime >= nmt:
+                            nmt, nsize, newest = st.st_mtime, st.st_size, e.name
+                if newest:
+                    sys.stdout.write("       ...running (%s): latest %s = %s, %ds ago\n" %
+                                     (name, newest, _human_size(nsize), int(time.time() - nmt)))
+                    sys.stdout.flush()
+            except Exception:
+                pass
+    hb = threading.Thread(target=_heartbeat, daemon=True)
+    hb.start()
+    try:
+        with open(job.log_path, "a") as lf:
+            for line in iter(proc.stdout.readline, ""):
+                lf.write(line)
+                lf.flush()
+            proc.stdout.close()
+        rc = proc.wait()
+    finally:
+        stop_hb.set()
+        job.proc = None
     step["rc"] = rc
     step["state"] = "done" if rc == 0 else "failed"
     _log(job, "\n### STEP %d %s finished rc=%d\n" % (num, name, rc))
@@ -751,8 +808,14 @@ def recent_layouts(cfg=None, limit=12, max_seconds=6.0, views=("layout",)):
         if time.time() > deadline:
             timed_out = True
             break
-        if not os.path.isdir(libpath) or not os.access(libpath, os.W_OK):
-            continue                                  # skip read-only (PDK/others)
+        if not os.path.isdir(libpath):
+            continue
+        # skip obvious read-only PDK/system libs for speed; include everything
+        # else (incl. SOFTINCLUDE'd design libs that may not be W_OK to you)
+        low = libpath.lower()
+        if (libpath.startswith(("/usr/", "/opt/", "/cad/", "/tools/", "/pkg/"))
+                or "/pdk" in low or "cdslib" in low):
+            continue
         try:
             cells = os.listdir(libpath)
         except OSError:
@@ -1155,11 +1218,20 @@ def run_job(job):
     cell = job.meta["cell"]
     view = job.meta["view"]
     job.state = "running"
+    _step_no = [0]
+
+    def phase(desc):
+        _step_no[0] += 1
+        _banner("STEP %d:" % _step_no[0], desc)
+
     try:
+        _banner("JOB START:", "%s   %s / %s / %s   (run dir: %s)" %
+                (tool.upper(), lib, cell, view, run_dir))
         # baseline for the progress bar: newest comparable prior run's log size
         job.meta["baseline_bytes"] = _find_baseline_bytes(job.meta)
 
         # 0. make sure the EDA tools are on PATH (auto `module load` if needed).
+        phase("Check environment (calibre/strmout on PATH; module-load if needed)")
         needed = ["calibre"] + ([] if job.meta.get("existing_gds") else ["strmout"])
         _ensure_tools(job, cfg, needed)
 
@@ -1167,6 +1239,8 @@ def run_job(job):
         gds_abs = os.path.join(run_dir, gds)
 
         # --- 1. stream out GDS from OA (unless user supplied an existing GDS) ---
+        phase("Layout: %s" % ("use existing GDS" if job.meta.get("existing_gds")
+                              else "stream out from OpenAccess (strmout)"))
         if job.meta.get("existing_gds"):
             src = os.path.abspath(os.path.expanduser(job.meta["existing_gds"]))
             _log(job, "Using existing GDS: %s\n" % src)
@@ -1194,6 +1268,7 @@ def run_job(job):
         # --- 2. optional source-netlist generation for LVS ---
         src_net = None
         if tool == "lvs":
+            phase("LVS source netlist")
             src_net = job.meta.get("src_net") or "%s.src.net" % cell
             src_net_abs = src_net if os.path.isabs(src_net) else os.path.join(run_dir, src_net)
             if not os.path.isfile(src_net_abs) and cfg.get("netlist_cmd", "").strip():
@@ -1211,6 +1286,7 @@ def run_job(job):
             src_net = src_net_abs
 
         # --- 3. write runset + launch calibre ---
+        phase("Generate runset + run Calibre %s (the long step)" % tool.upper())
         if tool == "drc":
             deck = job.meta.get("deck") or latest_deck("drc") or cfg["drc_deck"]
             _require_deck(deck, "DRC")
@@ -1231,6 +1307,7 @@ def run_job(job):
             result_file = os.path.join(run_dir, "%s.lvs.report" % cell)
 
         # --- 4. parse result ---
+        phase("Parse results")
         if os.path.isfile(result_file):
             parsed = detect_and_parse(result_file)
             parsed.pop("text", None)  # keep snapshot small
@@ -1252,10 +1329,14 @@ def run_job(job):
             json.dump(meta_out, f, indent=2)
 
         job.state = "done"
+        _banner("JOB DONE:", "%s %s -> %s" % (tool.upper(), cell,
+                (job.result or {}).get("status", "done")))
     except Exception as e:
         job.error = str(e)
         job.state = "failed"
         _log(job, "\n!!! JOB FAILED: %s\n%s\n" % (e, traceback.format_exc()))
+        _banner("JOB FAILED:", "%s %s" % (tool.upper(), cell))
+        _err(str(e))
     finally:
         job.finished = time.time()
 
@@ -1521,6 +1602,13 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json_body()
             if path == "/api/run":
                 return self._handle_run(body)
+            if path == "/api/stop":
+                job = JOBS.get(body.get("job_id", ""))
+                if not job:
+                    return self._send_json({"error": "no such job"}, 404)
+                killed = job.stop()
+                _err("STOP requested for job %s (%s)" % (job.id, job.meta.get("cell", "")))
+                return self._send_json({"ok": True, "killed_process": killed})
             if path == "/api/loadmodules":
                 return self._send_json(load_modules(body.get("modules", "")))
             if path == "/api/compare":
@@ -1720,9 +1808,8 @@ INDEX_HTML = r"""<!doctype html>
         <table id="searchtable"><thead><tr>
           <th class="sortable" data-k="mtime">Modified <span class="arrow"></span></th>
           <th class="sortable" data-k="type">Type <span class="arrow"></span></th>
-          <th class="sortable" data-k="name">File <span class="arrow"></span></th>
+          <th class="sortable" data-k="path">Full path <span class="arrow"></span></th>
           <th class="sortable" data-k="size">Size <span class="arrow"></span></th>
-          <th class="sortable" data-k="dir">Folder <span class="arrow"></span></th>
           <th></th>
         </tr></thead><tbody></tbody></table>
       </div>
@@ -1792,7 +1879,8 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="panel" id="livepanel" style="display:none">
-    <h2>Run status &nbsp;<span id="jobstate" class="pill muted"></span></h2>
+    <h2>Run status &nbsp;<span id="jobstate" class="pill muted"></span>
+      <button class="sec" id="stopbtn" style="float:right;padding:4px 14px;color:var(--bad);border-color:var(--bad);display:none">&#9632; Stop</button></h2>
     <div id="progwrap" style="margin:2px 0 14px">
       <div class="progbar"><div id="progfill" class="progfill"></div></div>
       <div id="progtext" class="muted" style="font-size:12px;margin-top:5px"></div>
@@ -2218,9 +2306,8 @@ function renderSearchRows(){
     const tr=document.createElement('tr');
     tr.innerHTML='<td style="white-space:nowrap">'+esc(fmtTime(r.mtime))+'</td>'+
       '<td><span class="pill muted">'+esc(r.type)+'</span></td>'+
-      '<td>'+esc(r.name)+'</td>'+
+      '<td style="font-size:12px;word-break:break-all">'+esc(r.path)+'</td>'+
       '<td style="white-space:nowrap">'+fmtSize(r.size)+'</td>'+
-      '<td class="muted" style="font-size:12px">'+esc(r.dir)+'</td>'+
       '<td style="white-space:nowrap"><button class="sec" style="padding:3px 9px" data-a="pre">use</button> '+
       '<button class="sec" style="padding:3px 9px" data-a="view">view</button> '+
       '<button class="sec" style="padding:3px 9px" data-a="copy">copy</button></td>';
@@ -2234,7 +2321,7 @@ function renderSearchRows(){
       $('#tab-history').classList.remove('hidden');viewResult(r.path);};
     tb.appendChild(tr);
   });
-  if(!rows.length)tb.innerHTML='<tr><td colspan=6 class="muted">no logs found &mdash; adjust user or add a folder above</td></tr>';
+  if(!rows.length)tb.innerHTML='<tr><td colspan=5 class="muted">no logs found &mdash; adjust user or add a folder above</td></tr>';
 }
 $$('#searchtable th.sortable').forEach(th=>th.onclick=()=>{
   const k=th.dataset.k;
@@ -2246,7 +2333,8 @@ $$('#searchtable th.sortable').forEach(th=>th.onclick=()=>{
 // ---- run ----
 let pollTimer=null, RESULT_SCROLLED=false, FOLLOW_LOG=true;
 function startRunUI(){ RESULT_SCROLLED=false; FOLLOW_LOG=true;
-  $('#resultpanel').style.display='none'; $('#livepanel').style.display='block'; }
+  $('#resultpanel').style.display='none'; $('#livepanel').style.display='block';
+  const sb=$('#stopbtn'); sb.disabled=false; sb.textContent='■ Stop'; sb.style.display='inline-block'; }
 // if the user scrolls up during a run, stop auto-following
 window.addEventListener('wheel',()=>{FOLLOW_LOG=false;},{passive:true});
 window.addEventListener('touchmove',()=>{FOLLOW_LOG=false;},{passive:true});
@@ -2287,26 +2375,38 @@ function renderProgress(d,st){
       ' <span class="muted">(no prior run for ETA)</span>';
   }
 }
+let CURRENT_JOB=null;
+$('#stopbtn').onclick=async()=>{
+  if(!CURRENT_JOB)return;
+  $('#stopbtn').disabled=true;$('#stopbtn').textContent='stopping...';
+  await jpost('/api/stop',{job_id:CURRENT_JOB});
+};
 async function pollJob(jid){
+  CURRENT_JOB=jid;
   const d=await jget('/api/job?id='+encodeURIComponent(jid));
   if(d.error){$('#jobstate').textContent=d.error;return;}
   const st=d.state;
   const cls=st==='done'?'good':(st==='failed'?'bad':'warn');
   $('#jobstate').className='pill '+cls;$('#jobstate').textContent=st;
+  $('#stopbtn').style.display=(st==='running'||st==='queued')?'inline-block':'none';
   renderProgress(d,st);
   $('#steps').innerHTML=(d.steps||[]).map((s,i)=>{
     const c=s.state==='done'?'good':(s.state==='failed'?'bad':'warn');
     const active=s.state==='running';
-    const box='margin:7px 0;padding:9px 12px;border-radius:6px;'+
+    // check box on the left: [ ] running, [x] done, [!] failed
+    const box=(s.state==='done'?'<span style="color:var(--good);font-size:18px">&#9745;</span>'
+              :s.state==='failed'?'<span style="color:var(--bad);font-size:18px">&#9746;</span>'
+              :'<span style="font-size:18px;color:var(--muted)">&#9744;</span>');
+    const style='display:flex;gap:10px;align-items:flex-start;margin:7px 0;padding:9px 12px;border-radius:6px;'+
       (active
         ? 'border:3px solid var(--acc);background:var(--acc-light);box-shadow:0 2px 8px rgba(0,82,204,.25);'
         : 'border:1px solid var(--line);background:var(--panel);');
-    return '<div style="'+box+'">'+
+    return '<div style="'+style+'">'+box+'<div style="flex:1">'+
       '<b style="font-size:15px">'+(i+1)+'.</b> '+
       (active?'<span class="spinner"></span>':'')+
       '<span class="pill '+c+'">'+esc(s.state)+'</span> '+
       '<b>'+esc(s.name)+'</b>'+(s.rc!=null?' <span class="muted">rc='+s.rc+'</span>':'')+
-      '<br><code style="font-size:11px">'+esc(s.cmd)+'</code></div>';
+      '<br><code style="font-size:11px">'+esc(s.cmd)+'</code></div></div>';
   }).join('');
   $('#joblog').textContent=d.log||'';
   $('#joblog').scrollTop=$('#joblog').scrollHeight;       // tail the live log
