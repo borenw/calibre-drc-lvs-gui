@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 18      # incremental build number, shown top-right in the GUI
+APP_REVISION = 19      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -848,7 +848,7 @@ def discover_run_dirs(cfg):
     return sorted(found)
 
 
-def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds=8.0):
+def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds=12.0):
     """Search /sim/<user> and other simulation roots for Calibre logs.
 
     Bounded by wall-clock (max_seconds) so a huge or slow (NFS) root can never
@@ -888,6 +888,10 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds
 
     deadline = time.time() + max_seconds
     _dbg("searchlogs: user=%s roots=%s budget=%.1fs" % (user, uroots, max_seconds))
+    sys.stdout.write("\n" + "=" * 72 +
+                     "\n======== LOG SEARCH:  scanning %d root(s) for Calibre logs "
+                     "(budget %ds)\n" % (len(uroots), int(max_seconds)) + "=" * 72 + "\n")
+    sys.stdout.flush()
     results, scanned, timed_out = [], [], False
     for root in uroots:
         exists = os.path.isdir(root)
@@ -896,7 +900,11 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds
         scanned.append(rec)
         if not exists:
             _dbg("searchlogs:   skip (absent) %s" % root)
+            sys.stdout.write("   (absent)  %s\n" % root)
+            sys.stdout.flush()
             continue
+        sys.stdout.write("   scanning  %s ...\n" % root)
+        sys.stdout.flush()
         t0 = time.time()
         base = root.rstrip("/").count("/")
         walker = os.walk(root, onerror=lambda e: _dbg("searchlogs:   walk error %s" % e))
@@ -931,10 +939,17 @@ def search_logs(user=None, extra=None, max_results=800, max_depth=4, max_seconds
         rec["seconds"] = round(time.time() - t0, 2)
         _dbg("searchlogs:   %s -> %d hits in %.2fs%s" %
              (root, rec["hits"], rec["seconds"], " (TIMED OUT)" if rec["timed_out"] else ""))
+        sys.stdout.write("      -> %d logs in %.1fs%s\n" %
+                         (rec["hits"], rec["seconds"], "   *** TIMED OUT ***" if rec["timed_out"] else ""))
+        sys.stdout.flush()
         if timed_out or len(results) >= max_results:
             break
     results.sort(key=lambda r: r["mtime"], reverse=True)
     _dbg("searchlogs: done -> %d logs, timed_out=%s" % (len(results), timed_out))
+    sys.stdout.write("======== LOG SEARCH DONE:  %d logs%s ========\n" %
+                     (len(results), "   (TIMED OUT on a slow root -- narrow sim_roots in Config)"
+                      if timed_out else ""))
+    sys.stdout.flush()
     return {"user": user, "login": getpass.getuser(), "roots": scanned,
             "count": len(results), "truncated": len(results) >= max_results,
             "timed_out": timed_out, "results": results}
@@ -1006,10 +1021,10 @@ def _fill(template, mapping):
 # --------------------------------------------------------------------------- #
 
 def _dbg(msg):
-    """Append a timestamped line to the on-disk GUI debug log."""
+    """Append a timestamped line to the on-disk GUI debug log (file only, so the
+    console stays clean for the phase banners)."""
     try:
         line = "[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
-        sys.stderr.write(line)
         if RUNS_BASE:
             with open(os.path.join(RUNS_BASE, "gui_debug.log"), "a") as f:
                 f.write(line)
