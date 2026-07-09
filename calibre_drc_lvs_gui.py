@@ -25,19 +25,26 @@ USAGE:
 No third-party dependencies -- Python 3.6+ stdlib only.
 """
 
+import sys
+
+if sys.version_info < (3, 5):
+    sys.stderr.write(
+        "\n  This tool requires Python 3.5+  (you are running %s).\n"
+        "  Run it with 'python3' instead of 'python'.\n\n"
+        % sys.version.split()[0])
+    raise SystemExit(1)
+
 import argparse
 import difflib
 import fnmatch
 import getpass
 import glob as globmod
-import html
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -1396,6 +1403,14 @@ INDEX_HTML = r"""<!doctype html>
          box-shadow:0 3px 10px rgba(10,143,111,.38)}
  .bigbtn:hover{filter:brightness(1.08);box-shadow:0 4px 14px rgba(10,143,111,.5)}
  .bigbtn:disabled{opacity:.55;cursor:default;filter:none}
+ /* big red round GO button */
+ .gobtn{width:104px;height:104px;border-radius:50%;border:0;cursor:pointer;flex:0 0 auto;
+        background:radial-gradient(circle at 38% 34%,#ff5a4d 0%,#e5352b 55%,#c31d14 100%);
+        color:#fff;font-size:32px;font-weight:800;letter-spacing:2px;
+        box-shadow:0 5px 16px rgba(197,29,20,.5),inset 0 2px 4px rgba(255,255,255,.25);
+        transition:transform .08s ease,filter .15s ease}
+ .gobtn:hover{filter:brightness(1.06)} .gobtn:active{transform:scale(.95)}
+ .gobtn:disabled{opacity:.5;cursor:default;filter:grayscale(.3)}
 </style></head>
 <body>
 <header>
@@ -1415,7 +1430,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="panel" style="border:2px solid var(--acc)">
     <h2 style="color:var(--acc)">Easy &mdash; one click does everything</h2>
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
-      <button id="easybtn" class="bigbtn">&#9889;&nbsp;Easy DRC &mdash; one click</button>
+      <button id="easybtn" class="gobtn">GO</button>
       <span class="muted" style="font-size:12px;max-width:640px">
         Loads the required modules &rarr; finds your most recent DRC log &rarr; re-runs DRC on that
         design with the latest rule deck &rarr; shows a live progress bar with %% and ETA below.</span>
