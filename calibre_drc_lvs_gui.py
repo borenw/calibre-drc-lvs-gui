@@ -157,7 +157,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 31      # incremental build number, shown top-right in the GUI
+APP_REVISION = 32      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -723,6 +723,51 @@ def latest_deck(kind):
         return list_decks(kind)["latest"]
     except Exception:
         return ""
+
+
+def discover_src_net(cell, cfg, run_dir=None):
+    """Find an existing LVS source netlist for `cell` on this host: <cell>.src.net
+    (or .sp / .cdl / .spi) in the run dir, the cds.lib library dirs, discovered
+    run dirs, and the log-search roots. Returns newest match, or ''."""
+    # Prefer canonical SCHEMATIC source netlists (.src.net auCdl, .cdl) over a
+    # bare .sp -- a <cell>.sp is often the LAYOUT-extracted spice from a prior LVS
+    # run, which as the "source" would be a false CORRECT (layout vs layout).
+    ext_priority = (".src.net", ".cdl", ".spi", ".net", ".sp")
+    dirs = []
+    if run_dir:
+        dirs.append(run_dir)
+    try:
+        dirs += list(parse_cds_lib(resolve_cds_lib(cfg)).values())
+    except Exception:
+        pass
+    try:
+        dirs += discover_run_dirs(cfg)
+    except Exception:
+        pass
+    for line in re.split(r"[\n,]+", cfg.get("sim_roots", "")):
+        line = line.strip().replace("{user}", getpass.getuser())
+        if line:
+            dirs.append(os.path.expanduser(os.path.expandvars(line)))
+    uniq = []
+    seen = set()
+    for d in dirs:
+        d = os.path.abspath(d)
+        if d not in seen and os.path.isdir(d):
+            seen.add(d)
+            uniq.append(d)
+    for ext in ext_priority:                 # first extension with any hit wins
+        best, best_mt = "", -1
+        for d in uniq:
+            p = os.path.join(d, cell + ext)
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if os.path.isfile(p) and mt > best_mt:
+                best, best_mt = p, mt
+        if best:
+            return best
+    return ""
 
 
 LOG_PATTERNS = ["*.drc.summary", "*.drc.results", "*.lvs.report", "*.lvs.report.ext",
@@ -1479,20 +1524,41 @@ def run_job(job):
         src_net = None
         if tool == "lvs":
             phase("LVS source netlist")
-            src_net = job.meta.get("src_net") or "%s.src.net" % cell
-            src_net_abs = src_net if os.path.isabs(src_net) else os.path.join(run_dir, src_net)
-            if not os.path.isfile(src_net_abs) and cfg.get("netlist_cmd", "").strip():
+            # 1) explicit path from the form, if given
+            src_net_abs = ""
+            explicit = (job.meta.get("src_net") or "").strip()
+            if explicit:
+                src_net_abs = explicit if os.path.isabs(explicit) else os.path.join(run_dir, explicit)
+                if not os.path.isfile(src_net_abs):
+                    sys.stdout.write("   -I- given src_net not found: %s -- will auto-search\n" % src_net_abs)
+                    src_net_abs = ""
+            # 2) a <cell>.src.net already sitting next to the layout / run dir
+            if not src_net_abs:
+                cand = os.path.join(run_dir, "%s.src.net" % cell)
+                if os.path.isfile(cand):
+                    src_net_abs = cand
+            # 3) auto-discover across cds.lib libs / run dirs / sim_roots
+            if not src_net_abs:
+                found = discover_src_net(cell, cfg, run_dir)
+                if found:
+                    src_net_abs = found
+                    sys.stdout.write("   -I- source netlist auto-detected: %s\n" % found)
+            # 4) optional generation via a configured netlister
+            if not src_net_abs and cfg.get("netlist_cmd", "").strip():
+                gen = os.path.join(run_dir, "%s.src.net" % cell)
                 mapping = {"cell": cell, "lib": lib, "view": view,
-                           "src_net": src_net, "calibre_bin": cfg["calibre_bin"]}
+                           "src_net": os.path.basename(gen), "calibre_bin": cfg["calibre_bin"]}
                 cmd = _fill(cfg["netlist_cmd"], mapping)
                 rc = _run_step(job, "generate source netlist", cmd, run_dir)
-                if rc != 0:
-                    raise RuntimeError("netlist generation failed (rc=%d)" % rc)
-            if not os.path.isfile(src_net_abs):
+                if rc == 0 and os.path.isfile(gen):
+                    src_net_abs = gen
+            if not src_net_abs or not os.path.isfile(src_net_abs):
                 raise RuntimeError(
-                    "LVS source netlist not found: %s\n"
-                    "Provide a path to an existing .src.net/.sp, or set a "
-                    "'netlist_cmd' in Config." % src_net_abs)
+                    "LVS source netlist not found for cell '%s'.\n"
+                    "Provide the path in the 'LVS source netlist' field (a .src.net / .sp / "
+                    ".cdl from the schematic), put a %s.src.net next to the layout, or set a "
+                    "'netlist_cmd' in Config to generate it." % (cell, cell))
+            _artifact("source net", src_net_abs)
             src_net = src_net_abs
 
         # --- 3. write runset + launch calibre ---
@@ -2113,8 +2179,8 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     <div id="lvsonly" class="row hidden">
       <div>
-        <label>LVS source netlist (.src.net / .sp) &mdash; path, or blank for &lt;cell&gt;.src.net in run dir</label>
-        <input type="text" id="srcnet" placeholder="(cell).src.net">
+        <label>LVS source netlist &mdash; <b>leave blank to auto-detect</b> &lt;cell&gt;.src.net (schematic), or give a path (.src.net / .cdl / .sp)</label>
+        <input type="text" id="srcnet" placeholder="blank = auto-detect (cell).src.net from cds.lib libs / run dirs / sim_roots">
       </div>
     </div>
     <details style="margin-top:10px"><summary>Advanced: use existing GDS instead of streaming out</summary>
