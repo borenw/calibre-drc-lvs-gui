@@ -13,6 +13,12 @@
   "lvs_deck": "/path/to/pdk/lvs/calibre.lvs",
   "lvs_deck_glob": "/path/to/pdk/lvs/calibre.lvs*",
 
+  "_comment_lvs_src": "LVS source netlist (schematic -> CDL). If a <cell>.src.net/.cdl is found it is reused; otherwise it is generated. netlist_mode: si (default, Cadence auCDL via si.env) | skill (virtuoso -nograph) | custom (netlist_cmd) | off. netlist_view is the SCHEMATIC view (not the layout view).",
+  "netlist_mode": "si",
+  "netlist_view": "schematic",
+  "si_bin": "si",
+  "virtuoso_bin": "virtuoso",
+
   "modules": "calibre cadence/ic618",
   "auto_load_modules": "yes",
 

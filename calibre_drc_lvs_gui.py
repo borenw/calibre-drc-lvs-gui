@@ -109,9 +109,31 @@ DEFAULT_CONFIG = {
     "drc_cmd": "{calibre_bin} -drc -hier -turbo {runfile}",
     "lvs_cmd": "{calibre_bin} -lvs -hier -spice {spiceout} {runfile}",
 
-    # Optional: command to generate the LVS source netlist from schematic.
-    # Leave blank -> the GUI expects an existing source netlist file instead.
-    "netlist_cmd": "",
+    # ---- LVS source netlist (schematic -> CDL/SPICE) ---------------------- #
+    # The LVS *source* is netlisted from the SCHEMATIC (not the layout). If a
+    # source netlist for the cell already exists it is reused as-is; otherwise
+    # the GUI generates one. "netlist_mode" selects how:
+    #   si     -> Cadence auCDL netlister: write a si.env into the run dir and
+    #             run `si <run_dir> -batch -command netlist` (ships with
+    #             Virtuoso -- same module as strmout). This is the default.
+    #   skill  -> run a generated SKILL script under `virtuoso -nograph`
+    #             (deOpenCellViewByType + auCdl createNetlist).
+    #   custom -> use `netlist_cmd` verbatim (a site wrapper / other netlister).
+    #   off    -> never generate; require a pre-existing source netlist.
+    # A non-blank "netlist_cmd" always wins (back-compat with older configs).
+    "netlist_mode": _env("NETLIST_MODE", "si"),
+    "si_bin": _env("SI_BIN", "si"),
+    "virtuoso_bin": _env("VIRTUOSO_BIN", "virtuoso"),
+    # Schematic view to netlist for the LVS source (usually "schematic" --
+    # NOT the layout view used for strmout).
+    "netlist_view": _env("NETLIST_VIEW", "schematic"),
+    # Command templates. {placeholders}: run_dir cell lib netlist_view src_net
+    # cdslib si_bin virtuoso_bin skill_script netlist_log calibre_bin.
+    "si_cmd": "{si_bin} {run_dir} -batch -command netlist -cdslib {cdslib}",
+    "netlist_skill_cmd": ("{virtuoso_bin} -nograph -replay {skill_script} "
+                          "-log {netlist_log}"),
+    # Fully custom netlister (wins over netlist_mode when non-blank).
+    "netlist_cmd": _env("NETLIST_CMD", ""),
 
     # Environment / module auto-loading. If strmout/calibre are not on PATH,
     # the tool can run `module load <modules>` for you (in a login shell) and
@@ -157,7 +179,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 32      # incremental build number, shown top-right in the GUI
+APP_REVISION = 33      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1254,6 +1276,151 @@ def _write_lvs_runset(run_dir, cell, gds, src_net, deck, extra):
     return runfile
 
 
+def _write_si_env(run_dir, lib, cell, view, out_name):
+    """Write a si.env that drives Cadence's auCDL netlister to emit a CDL
+    source netlist for lib/cell/view. Read by `si <run_dir> -batch -command
+    netlist`. Values are SKILL (t/nil). The netlist lands in the run dir as
+    `out_name` (and/or a bare `netlist` file, which the caller normalizes)."""
+    envfile = os.path.join(run_dir, "si.env")
+    with open(envfile, "w", encoding="utf-8") as f:
+        f.write(";; Auto-generated si.env (auCDL) -- %s\n"
+                % time.strftime("%Y-%m-%d %H:%M:%S"))
+        f.write('simLibName = "%s"\n' % lib)
+        f.write('simCellName = "%s"\n' % cell)
+        f.write('simViewName = "%s"\n' % view)
+        f.write('simSimulator = "auCdl"\n')
+        f.write("simNotIncremental = 1\n")
+        f.write("simReNetlistAll = nil\n")
+        f.write("simViewList = '(\"auCdl\" \"schematic\")\n")
+        f.write("simStopList = '(\"auCdl\")\n")
+        f.write("simNetlistHier = t\n")
+        f.write('hnlNetlistFileName = "%s"\n' % out_name)
+        f.write('simNetlistName = "%s"\n' % out_name)
+        f.write('resistorModel = ""\n')
+        f.write("shortRES = 2000.0\n")
+        f.write("preserveRES = t\n")
+        f.write("checkRESVAL = t\n")
+        f.write("checkRESSIZE = nil\n")
+        f.write("preserveCAP = t\n")
+        f.write("checkCAPVAL = t\n")
+        f.write("checkCAPAREA = nil\n")
+        f.write("checkCAPPERI = nil\n")
+        f.write("preserveDIODE = t\n")
+        f.write("checkDIODEAREA = nil\n")
+        f.write("checkDIODEPERI = nil\n")
+        f.write("preserveBIPOLAR = t\n")
+        f.write("preservePMOS = t\n")
+        f.write("preserveNMOS = t\n")
+        f.write("shrinkFACTOR = 0.0\n")
+        f.write('globalPowerSig = ""\n')
+        f.write('globalGroundSig = ""\n')
+        f.write("displayPININFO = t\n")
+        f.write("preserveALL = t\n")
+        f.write('setEQUIV = ""\n')
+        f.write('incFILE = ""\n')
+    return envfile
+
+
+def _write_netlist_skill(run_dir, lib, cell, view, out_name):
+    """Write a SKILL script that netlists lib/cell/view to a CDL source netlist,
+    to be run headless via `virtuoso -nograph -replay`. Uses the auCdl analog
+    netlister (simulator/design/createNetlist) after opening the cellview with
+    deOpenCellViewByType. Adjust the netlister call for your site if needed."""
+    ilfile = os.path.join(run_dir, "netlist_%s.il" % cell)
+    out_path = os.path.join(run_dir, out_name)
+    with open(ilfile, "w", encoding="utf-8") as f:
+        f.write(";; Auto-generated CDL netlister -- %s\n"
+                % time.strftime("%Y-%m-%d %H:%M:%S"))
+        f.write("let((cv produced outfile infile2 line)\n")
+        f.write('  cv = deOpenCellViewByType("%s" "%s" "%s" "" "r")\n'
+                % (lib, cell, view))
+        f.write('  unless(cv error("cannot open %s/%s/%s for netlisting\\n"))\n'
+                % (lib, cell, view))
+        f.write("  simulator('auCdl)\n")
+        f.write('  design("%s" "%s" "%s")\n' % (lib, cell, view))
+        f.write('  resultsDir("%s")\n' % run_dir)
+        f.write("  createNetlist(?recreateAll t ?display nil)\n")
+        # auCdl writes <resultsDir>/netlist -- normalize to the expected name.
+        f.write('  produced = "%s/netlist"\n' % run_dir)
+        f.write('  when(isFile(produced)\n')
+        f.write('    outfile = outfile("%s")\n' % out_path)
+        f.write('    infile2 = infile(produced)\n')
+        f.write('    when(infile2 && outfile\n')
+        f.write('      while(gets(line infile2) fprintf(outfile "%s" line))\n')
+        f.write('      close(infile2) close(outfile)))\n')
+        f.write(")\n")
+        f.write("exit(0)\n")
+    return ilfile
+
+
+def _generate_src_net(job, cfg, run_dir, lib, cell, src_view):
+    """Generate an LVS source netlist (schematic -> CDL) for lib/cell/src_view
+    into run_dir; return the netlist path, or '' if generation is off/failed.
+    Dispatch: a non-blank netlist_cmd wins, else netlist_mode (si|skill|off)."""
+    out_name = "%s.src.net" % cell
+    out_path = os.path.join(run_dir, out_name)
+
+    # a local cds.lib in the run dir that INCLUDEs the real one (for `si -cdslib`
+    # and for virtuoso's DEFINE search). Reuse the one strmout may have written.
+    cdslib = os.path.join(run_dir, "cds.lib")
+    if not os.path.isfile(cdslib):
+        cds = resolve_cds_lib(cfg)
+        if cds:
+            with open(cdslib, "w", encoding="utf-8") as f:
+                f.write('INCLUDE "%s"\n' % cds)
+
+    mode = (cfg.get("netlist_mode") or "si").strip().lower()
+    custom = (cfg.get("netlist_cmd") or "").strip()
+    mapping = {
+        "run_dir": run_dir, "cell": cell, "lib": lib,
+        "view": src_view, "netlist_view": src_view,
+        "src_net": out_name, "cdslib": cdslib,
+        "si_bin": cfg.get("si_bin") or "si",
+        "virtuoso_bin": cfg.get("virtuoso_bin") or "virtuoso",
+        "calibre_bin": cfg.get("calibre_bin") or "calibre",
+        "netlist_log": "netlist_%s.log" % cell,
+        "skill_script": "",
+    }
+
+    if custom:
+        cmd = _fill(custom, mapping)
+        _run_step(job, "generate source netlist (custom)", cmd, run_dir)
+    elif mode == "off":
+        sys.stdout.write("   -I- netlist_mode=off -- not generating a source netlist\n")
+        sys.stdout.flush()
+        return ""
+    elif mode == "si":
+        if not shutil.which(cfg.get("si_bin") or "si"):
+            _ensure_tools(job, cfg, ["si"])       # auto module-load if missing
+        _artifact("si.env", _write_si_env(run_dir, lib, cell, src_view, out_name))
+        cmd = _fill(cfg.get("si_cmd") or "", mapping)
+        _run_step(job, "generate source netlist (si auCDL)", cmd, run_dir)
+    elif mode == "skill":
+        if not shutil.which(cfg.get("virtuoso_bin") or "virtuoso"):
+            _ensure_tools(job, cfg, ["virtuoso"])
+        ilfile = _write_netlist_skill(run_dir, lib, cell, src_view, out_name)
+        mapping["skill_script"] = os.path.basename(ilfile)
+        _artifact("skill script", ilfile)
+        cmd = _fill(cfg.get("netlist_skill_cmd") or "", mapping)
+        _run_step(job, "generate source netlist (virtuoso -nograph)", cmd, run_dir)
+    else:
+        raise RuntimeError("unknown netlist_mode %r (use si|skill|custom|off)" % mode)
+
+    # locate the produced netlist -- auCdl may emit `out_name`, a bare `netlist`,
+    # or <cell>.cdl; normalize whichever exists to <cell>.src.net.
+    for cand in (out_path, os.path.join(run_dir, "netlist"),
+                 os.path.join(run_dir, "%s.cdl" % cell),
+                 os.path.join(run_dir, "%s.src" % cell)):
+        if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+            if os.path.abspath(cand) != os.path.abspath(out_path):
+                shutil.copyfile(cand, out_path)
+                sys.stdout.write("   -I- netlist %s -> %s\n"
+                                 % (os.path.basename(cand), out_name))
+                sys.stdout.flush()
+            return out_path
+    return ""
+
+
 def _fill(template, mapping):
     return shlex.split(template.format(**mapping))
 
@@ -1543,21 +1710,30 @@ def run_job(job):
                 if found:
                     src_net_abs = found
                     sys.stdout.write("   -I- source netlist auto-detected: %s\n" % found)
-            # 4) optional generation via a configured netlister
-            if not src_net_abs and cfg.get("netlist_cmd", "").strip():
-                gen = os.path.join(run_dir, "%s.src.net" % cell)
-                mapping = {"cell": cell, "lib": lib, "view": view,
-                           "src_net": os.path.basename(gen), "calibre_bin": cfg["calibre_bin"]}
-                cmd = _fill(cfg["netlist_cmd"], mapping)
-                rc = _run_step(job, "generate source netlist", cmd, run_dir)
-                if rc == 0 and os.path.isfile(gen):
-                    src_net_abs = gen
+            # 4) generate it from the schematic (si auCDL / virtuoso SKILL /
+            #    custom netlister) -- unless netlist_mode=off.
+            if not src_net_abs:
+                src_view = (job.meta.get("src_view")
+                            or cfg.get("netlist_view") or "schematic").strip()
+                if not lib or lib == "existingGDS":
+                    sys.stdout.write("   -I- no OA library for this run: cannot netlist a "
+                                     "schematic -- provide a source netlist path\n")
+                    sys.stdout.flush()
+                else:
+                    sys.stdout.write("   -I- no source netlist found -- generating from "
+                                     "schematic (%s/%s/%s, mode=%s)\n" %
+                                     (lib, cell, src_view, cfg.get("netlist_mode") or "si"))
+                    sys.stdout.flush()
+                    gen = _generate_src_net(job, cfg, run_dir, lib, cell, src_view)
+                    if gen:
+                        src_net_abs = gen
             if not src_net_abs or not os.path.isfile(src_net_abs):
                 raise RuntimeError(
-                    "LVS source netlist not found for cell '%s'.\n"
+                    "LVS source netlist not found/generated for cell '%s'.\n"
                     "Provide the path in the 'LVS source netlist' field (a .src.net / .sp / "
-                    ".cdl from the schematic), put a %s.src.net next to the layout, or set a "
-                    "'netlist_cmd' in Config to generate it." % (cell, cell))
+                    ".cdl from the schematic), put a %s.src.net next to the layout, set a "
+                    "schematic 'netlist_view'/'netlist_mode' in Config so it can be generated "
+                    "with `si`/virtuoso, or set a custom 'netlist_cmd'." % (cell, cell))
             _artifact("source net", src_net_abs)
             src_net = src_net_abs
 
@@ -1952,6 +2128,7 @@ class Handler(BaseHTTPRequestHandler):
             "view": view or "layout",
             "deck": body.get("deck", "").strip() or None,
             "src_net": body.get("src_net", "").strip() or None,
+            "src_view": body.get("src_view", "").strip() or None,
             "existing_gds": body.get("existing_gds", "").strip() or None,
             "cfg_snapshot": cfg_snap,
         }
@@ -2177,10 +2354,18 @@ INDEX_HTML = r"""<!doctype html>
         <datalist id="decklist"></datalist>
       </div>
     </div>
-    <div id="lvsonly" class="row hidden">
-      <div>
-        <label>LVS source netlist &mdash; <b>leave blank to auto-detect</b> &lt;cell&gt;.src.net (schematic), or give a path (.src.net / .cdl / .sp)</label>
-        <input type="text" id="srcnet" placeholder="blank = auto-detect (cell).src.net from cds.lib libs / run dirs / sim_roots">
+    <div id="lvsonly" class="hidden">
+      <div class="row">
+        <div>
+          <label>LVS source netlist &mdash; <b>leave blank to auto-detect or generate</b> from the schematic, or give a path (.src.net / .cdl / .sp)</label>
+          <input type="text" id="srcnet" placeholder="blank = find (cell).src.net, else netlist the schematic via si/virtuoso">
+        </div>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <div>
+          <label>Schematic source view <span class="muted">(for netlisting; blank = config <code>netlist_view</code>, default schematic)</span></label>
+          <input type="text" id="srcview" placeholder="schematic">
+        </div>
       </div>
     </div>
     <details style="margin-top:10px"><summary>Advanced: use existing GDS instead of streaming out</summary>
@@ -2682,7 +2867,8 @@ window.addEventListener('wheel',()=>{FOLLOW_LOG=false;},{passive:true});
 window.addEventListener('touchmove',()=>{FOLLOW_LOG=false;},{passive:true});
 $('#runbtn').onclick=async()=>{
   const body={tool:currentTool(),lib:$('#lib').value,cell:$('#cell').value,view:$('#view').value,
-    deck:$('#deck').value,src_net:$('#srcnet').value,existing_gds:$('#existinggds').value};
+    deck:$('#deck').value,src_net:$('#srcnet').value,src_view:$('#srcview').value,
+    existing_gds:$('#existinggds').value};
   if(!body.cell){$('#runmsg').textContent='pick a cell (or use an existing GDS)';return;}
   if(!body.existing_gds && (!body.lib||!body.view)){$('#runmsg').textContent='pick lib/cell/view, or set an existing GDS';return;}
   $('#runbtn').disabled=true;$('#runmsg').textContent='launching...';
@@ -2981,7 +3167,13 @@ const CFG_LABELS={
   drc_deck:'DRC rule deck (fallback)',drc_antenna_deck:'DRC antenna deck',lvs_deck:'LVS rule deck (fallback)',
   drc_deck_glob:'DRC deck glob (newest auto-picked)',lvs_deck_glob:'LVS deck glob (newest auto-picked)',
   strmout_cmd:'strmout command template',drc_cmd:'DRC command template',lvs_cmd:'LVS command template',
-  netlist_cmd:'source-netlist command template (optional)',
+  netlist_mode:'LVS source-netlist generator (si | skill | custom | off)',
+  netlist_view:'schematic view to netlist for LVS source (default schematic)',
+  si_bin:'si executable (auCDL netlister, ships with Virtuoso)',
+  virtuoso_bin:'virtuoso executable (for skill netlist mode)',
+  si_cmd:'si auCDL command template',
+  netlist_skill_cmd:'virtuoso -nograph SKILL command template',
+  netlist_cmd:'custom source-netlist command template (wins if set)',
   modules:'modules to auto-load if tools missing',
   module_load_cmd:'module-load command template ({modules})',
   auto_load_modules:'auto module-load on run (yes/no)',

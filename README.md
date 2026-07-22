@@ -81,6 +81,20 @@ or with environment variables (`CDS_LIB`, `LAYERMAP`, `DRC_DECK`, `DRC_DECK_GLOB
   out of OpenAccess (`strmout` → GDS), generates a Calibre SVRF runset that `INCLUDE`s
   your rule deck, and launches `calibre -drc` / `-lvs`. You can also point at an
   existing GDS to skip stream-out (no library needed).
+- **LVS source netlist — auto-generated from the schematic.** For LVS the *source*
+  is netlisted from the **schematic** view (not the layout). If a `<cell>.src.net`
+  / `.cdl` already exists it's reused; otherwise the GUI **generates a CDL** for you:
+  - `netlist_mode = si` (default) — writes a `si.env` into the run dir and runs
+    Cadence's **auCDL netlister**, `si <run_dir> -batch -command netlist` (`si`
+    ships with Virtuoso, same module as `strmout`).
+  - `netlist_mode = skill` — writes a SKILL script and runs it under
+    **`virtuoso -nograph -replay`** (`deOpenCellViewByType` + auCdl `createNetlist`).
+  - `netlist_mode = custom` — runs your own `netlist_cmd` template.
+  - `netlist_mode = off` — never generate; require an existing netlist.
+
+  The **schematic view** to netlist is `netlist_view` (default `schematic`),
+  overridable per-run in the LVS form. The produced netlist is normalized to
+  `<cell>.src.net` and fed to the LVS runset as `SOURCE PATH … SOURCE SYSTEM SPICE`.
 - **Type-or-pick inputs** — library / cell / view have a **▼ dropdown** (click to see &
   filter all options) *and* accept free-text typing. `cds.lib` is parsed following both
   `INCLUDE` and `SOFTINCLUDE`.
@@ -131,6 +145,10 @@ Nothing site-specific is baked into the script. Keys (all editable in the Config
 | `techlib` / `layermap` | `<tech_lib>` / `.../stream.layermap` | stream-out settings |
 | `drc_deck` / `lvs_deck` | deck file paths | INCLUDEd by the generated runset |
 | `drc_deck_glob` / `lvs_deck_glob` | `.../DECK.*` | newest match auto-selected |
+| `netlist_mode` | `si` | LVS source-netlist generator: `si` / `skill` / `custom` / `off` |
+| `netlist_view` | `schematic` | **schematic** view netlisted for the LVS source |
+| `si_bin` / `virtuoso_bin` | `si` / `virtuoso` | netlister executables (ship with Virtuoso) |
+| `si_cmd` / `netlist_skill_cmd` / `netlist_cmd` | command templates | auCDL / SKILL / custom netlister invocations |
 | `modules` | `calibre cadence/ic618` | auto-`module load`ed when tools are missing |
 | `sim_roots` | `/sim/{user}` … | log-search roots (`{user}` expands) |
 | `*_cmd` | command templates | `strmout` / `calibre` / `module load` invocations |
@@ -142,14 +160,20 @@ Nothing site-specific is baked into the script. Keys (all editable in the Config
 ## How it works
 
 ```
-lib/cell/view ──strmout──▶ cell.calibre.db (GDS)
-                                │
-        generated SVRF runset ──┤  LAYOUT PATH / PRIMARY + INCLUDE <deck>
-                                ▼
-                    calibre -drc / -lvs  ──▶  cell.drc.summary / cell.lvs.report
+lib/cell/layout ──strmout─────▶ cell.calibre.db (GDS) ──┐  LAYOUT PATH / PRIMARY
                                                         │
-                                                   parsed + compared
+lib/cell/schematic ──si auCDL──▶ cell.src.net (CDL) ────┤  SOURCE PATH / PRIMARY
+  (si.env / virtuoso -nograph;                          │
+   reused if it already exists)      generated SVRF ────┤  + INCLUDE <deck>
+                                          runset        ▼
+                              calibre -drc / -lvs  ──▶  cell.drc.summary / cell.lvs.report
+                                                                │
+                                                           parsed + compared
 ```
+
+For LVS the layout comes from `strmout` (shared with DRC) and the **source**
+netlist is generated from the schematic via `si` (auCDL) or `virtuoso -nograph`,
+then both are handed to `calibre -lvs`.
 
 Each run lands in `calibre_runs/<tool>_<lib>_<cell>_<view>_<timestamp>/` with the
 generated runset, the full `run.log`, the result report, and a `metadata.json` used
@@ -158,7 +182,8 @@ by the History and Compare tabs.
 ## Requirements
 
 - Python 3.6+ (standard library only)
-- Siemens Calibre (`calibre`) and, for OA stream-out, Cadence Virtuoso (`strmout`)
+- Siemens Calibre (`calibre`) and, for OA stream-out, Cadence Virtuoso (`strmout`);
+  for LVS source-netlist generation, `si` (auCDL) or `virtuoso` — both from Virtuoso
 - A browser on the same host (or via SSH port-forward / X)
 
 ## Troubleshooting
@@ -176,6 +201,9 @@ per step (`------ command used for X ------`), a 5-second heartbeat, and errors 
 | `GMD unable to load shared library` (strmout) | Cadence env issue on that host (`LD_LIBRARY_PATH` / version mismatch). Bypass it: use **Advanced → existing GDS** or the **Existing runsets** panel to run on a `.calibre.db` directly (skips stream-out). |
 | `'ascii' codec can't … (� / 0x..)` | Your locale is `C`/POSIX so Python defaulted to ASCII; the tool now forces UTF-8, but for clean output also `export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8` before launching. |
 | `strmout … rc=255` | Generic Cadence failure — the real reason is dumped to the console (`-E- last output of 'strmout' …`): usually library/view not in `cds.lib`, a bad `layermap`/`techlib`, GMD shared-lib, or write permissions. |
+| `LVS source netlist not found/generated` | No `<cell>.src.net`/`.cdl` was found **and** generation didn't produce one. Check the **schematic view** name (`netlist_view`, default `schematic`) exists for the cell, that `si` (or `virtuoso`) is on `PATH` (same module as `strmout`), and read the `-E-` dump from the `si`/`virtuoso` step. Or set an explicit path in the **LVS source netlist** field / `netlist_mode = off` to require a hand-supplied netlist. |
+| `si: command not found` | The auCDL netlister `si` ships with **Cadence Virtuoso**, not Calibre — add your Cadence module to `modules` (e.g. `calibre cadence/ic618`) or set `si_bin` to an absolute path. Prefer the SKILL route? Set `netlist_mode = skill` (uses `virtuoso -nograph`). |
+| `si` runs but netlist is empty / wrong | The generated `si.env` is a sensible default but auCDL options are site/PDK-specific (globals, `resistorModel`, `shortRES`, `simViewList`/`simStopList`). Edit the run dir's `si.env` and re-run, or switch to `netlist_mode = custom` with your PDK's own netlister in `netlist_cmd`. |
 | Log search "stalled" / very slow | A search root is on a slow/stalled NFS mount. Each root now has a per-root timeout (abandoned + reported), but narrow **Config → `sim_roots`** to your fast log dir for speed. |
 | Browser errors on `--open` (`XPCOMGlueLoad`, `gio`, `PNG…`) | A broken/remote browser. Run **without `--open`** and open the URL yourself, or forward it: `ssh -L 8899:127.0.0.1:8899 you@host`. |
 | `server_bind` / address in use | The port is busy — the tool now auto-hops to the next free port and prints it. |
