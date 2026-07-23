@@ -195,7 +195,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 43      # incremental build number, shown top-right in the GUI
+APP_REVISION = 44      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -560,6 +560,29 @@ def detect_and_parse(path):
 #  Job management (background subprocess pipelines)
 # --------------------------------------------------------------------------- #
 
+def build_reproduce(meta, steps):
+    """A single copy/paste shell command to reproduce the run's result on the
+    command line: load the modules, cd to the run dir, and re-run the exact
+    Calibre command on the runset/GDS/netlist already sitting there. Each step's
+    `cmd` is already shell-quoted."""
+    cfg = meta.get("cfg_snapshot", {}) or {}
+    run_dir = meta.get("run_dir", "")
+    mods = (cfg.get("modules") or "").strip()
+    cal = ""
+    for s in steps or []:
+        if (s.get("name") or "").lower().startswith("calibre"):
+            cal = s.get("cmd", "")            # last calibre step wins
+    if not cal:
+        return ""
+    parts = []
+    if mods:
+        parts.append("module load %s" % mods)
+    if run_dir:
+        parts.append("cd %s" % shlex.quote(run_dir))
+    parts.append(cal)
+    return " && ".join(parts)
+
+
 class Job(object):
     def __init__(self, job_id, meta):
         self.id = job_id
@@ -588,15 +611,17 @@ class Job(object):
 
     def snapshot(self, log_tail_bytes=200000):
         with self._lock:
+            steps = list(self.steps)
             data = {
                 "id": self.id,
                 "state": self.state,
-                "steps": list(self.steps),
+                "steps": steps,
                 "meta": self.meta,
                 "error": self.error,
                 "result": self.result,
                 "started": self.started,
                 "finished": self.finished,
+                "reproduce": build_reproduce(self.meta, steps),
             }
         # read log tail
         log = ""
@@ -2780,6 +2805,14 @@ INDEX_HTML = r"""<!doctype html>
       <div id="progtext" style="font-size:15px;margin-top:7px;color:var(--fg)"></div>
     </div>
     <div id="steps"></div>
+    <div id="reprowrap" style="display:none;margin:10px 0;padding:10px 12px;border:1px solid var(--line);border-radius:6px;background:var(--panel2)">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <b style="font-size:13px">Reproduce on the command line</b>
+        <button class="sec" id="reprocopy" style="padding:3px 12px">&#128203; Copy</button>
+        <span class="muted" style="font-size:11px">re-runs the exact Calibre command on the runset/GDS/netlist in the run dir</span>
+      </div>
+      <pre id="reprocmd" style="margin:0;white-space:pre-wrap;word-break:break-all;font-size:12px"></pre>
+    </div>
     <details open><summary>Live log</summary><pre id="joblog">...</pre></details>
   </div>
 
@@ -3388,6 +3421,12 @@ async function pollJob(jid){
       '<b>'+esc(s.name)+'</b>'+(s.rc!=null?' <span class="muted">rc='+s.rc+'</span>':'')+
       '<br><code style="font-size:11px">'+esc(s.cmd)+'</code></div></div>';
   }).join('');
+  // one-click reproduce command (shown once a Calibre step exists)
+  if(d.reproduce){
+    $('#reprocmd').textContent=d.reproduce;
+    $('#reprowrap').style.display='block';
+    $('#reprocopy').onclick=()=>copyText(d.reproduce,$('#reprocopy'));
+  }else{ $('#reprowrap').style.display='none'; }
   $('#joblog').textContent=d.log||'';
   $('#joblog').scrollTop=$('#joblog').scrollHeight;       // tail the live log
   // show the Result in its own section once available; auto-scroll there once
