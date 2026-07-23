@@ -179,7 +179,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 35      # incremental build number, shown top-right in the GUI
+APP_REVISION = 36      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -494,6 +494,7 @@ def extract_design_from_file(path):
                 lp = os.path.join(os.path.dirname(os.path.abspath(path)), lp)
             out["layout_path"] = lp
             out["layout_exists"] = os.path.isfile(lp)
+        out["rulefile"] = os.path.abspath(path)   # the known-good runset itself
         out["notes"].append("SVRF rule file: recovered source/deck for rerun")
 
     # If lib unknown but we have a cell, look it up by scanning cds.lib libraries.
@@ -1632,6 +1633,85 @@ def _ensure_tools(job, cfg, tools):
          ", ".join("%s=%s" % (t, shutil.which(_bin_for(cfg, t))) for t in tools))
 
 
+def _scan_calibre_errors(log_path, max_lines=600):
+    """Pull the salient Calibre compile/runtime error lines from the tail of a run
+    log, plus any 'undefined layer name parameter: X' layer names it complains
+    about. Returns (error_lines, undefined_layers)."""
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-max_lines:]
+    except Exception:
+        return [], []
+    errs, layers, seen = [], [], set()
+    err_re = re.compile(r"undefined layer|unrecognized|not defined|isn'?t defined|"
+                        r"problem with access|syntax error|\*error\*|^error|"
+                        r"\berror\b.*line\s+\d+", re.I)
+    lyr_re = re.compile(r"undefined layer name parameter:\s*([A-Za-z0-9_]+)", re.I)
+    for ln in lines:
+        s = ln.strip()
+        if s and err_re.search(s) and s not in seen:
+            seen.add(s)
+            errs.append(s)
+        m = lyr_re.search(ln)
+        if m and m.group(1) not in layers:
+            layers.append(m.group(1))
+    return errs[-20:], layers
+
+
+def _debug_help(job, tool, run_dir, runfile, deck, runset_src):
+    """On a Calibre failure, print a copy/paste debug block -- to the console AND
+    the run log (so it shows in the browser log view too): the generated runset,
+    the deck, detected errors, and ready-to-run `diff` / `grep` / reproduce
+    commands. `runset_src` is the known-good runset the run was prefilled from
+    (or None), so we can hand the user an exact diff to read back."""
+    q = shlex.quote
+    cell = job.meta.get("cell", "")
+    calibre = job.meta.get("cfg_snapshot", {}).get("calibre_bin") or "calibre"
+    deckdir = os.path.dirname(deck) if deck else ""
+    errs, layers = _scan_calibre_errors(job.log_path)
+    base = os.path.basename(runfile) if runfile else ""
+    repro = ("%s -lvs -hier -spice %s.sp %s" % (calibre, cell, q(base))) if tool == "lvs" \
+        else ("%s -drc -hier -turbo %s" % (calibre, q(base)))
+
+    L = ["", "=" * 72,
+         "=====  DEBUG HELP  (copy/paste a command below, run it, read me the output)  =====",
+         "=" * 72,
+         "generated runset : %s" % runfile,
+         "deck INCLUDEd    : %s" % (deck or "(none)"),
+         "run directory    : %s" % run_dir,
+         "full run log     : %s" % job.log_path]
+    if runset_src:
+        L.append("known-good runset: %s%s" % (runset_src,
+                 "" if os.path.isfile(runset_src) else "   (NOT FOUND)"))
+    if errs:
+        L.append("")
+        L.append("detected Calibre error(s):")
+        L += ["   %s" % e for e in errs[:12]]
+    L.append("")
+    L.append("# ---------- copy/paste commands ----------")
+    if runset_src and os.path.isfile(runset_src):
+        L.append("# 1) diff the GUI-generated runset vs your known-good runset")
+        L.append("#    (the KEY comparison -- shows any #DEFINE / INCLUDE / option we dropped):")
+        L.append("diff -u %s %s" % (q(runset_src), q(runfile)))
+    else:
+        L.append("# 1) show the runset the GUI generated (paste it back to me):")
+        L.append("cat %s" % q(runfile))
+    for lyr in layers:
+        L.append("# 2) find where layer '%s' is supposed to be derived in the deck tree:" % lyr)
+        L.append("grep -rniE %s %s | head -30" %
+                 (q(r"\b%s\b" % lyr), q(deckdir or "<deck-dir>")))
+    L.append("# 3) reproduce the exact Calibre run by hand (env must be module-loaded):")
+    L.append("cd %s && %s" % (q(run_dir), repro))
+    L.append("# 4) the full log:")
+    L.append("less %s" % q(job.log_path))
+    L.append("=" * 72)
+    L.append("")
+    block = "\n".join(L)
+    sys.stdout.write(block)
+    sys.stdout.flush()
+    _log(job, block)                       # also into run.log -> visible in the browser
+
+
 def run_job(job):
     cfg = job.meta["cfg_snapshot"]
     run_dir = job.meta["run_dir"]
@@ -1807,6 +1887,10 @@ def run_job(job):
             rc = _run_step(job, "calibre LVS", cmd, run_dir)
             result_file = os.path.join(run_dir, "%s.lvs.report" % cell)
         _artifact("result", result_file)
+        # On a Calibre failure (nonzero rc, or no result produced), emit a
+        # copy/paste debug block with a ready diff vs the known-good runset.
+        if rc != 0 or not os.path.isfile(result_file):
+            _debug_help(job, tool, run_dir, runfile, deck, job.meta.get("runset_src"))
 
         # --- 4. parse result ---
         phase("Parse results")
@@ -2154,6 +2238,7 @@ class Handler(BaseHTTPRequestHandler):
             "deck": body.get("deck", "").strip() or None,
             "src_net": body.get("src_net", "").strip() or None,
             "src_view": body.get("src_view", "").strip() or None,
+            "runset_src": body.get("runset_src", "").strip() or None,  # known-good runset (debug diff)
             "existing_gds": body.get("existing_gds", "").strip() or None,
             "cfg_snapshot": cfg_snap,
         }
@@ -2594,12 +2679,14 @@ $('#lib').addEventListener('change',()=>{loadCells();});
 $('#cell').addEventListener('change',()=>{loadViews();});
 
 // ---- prefill from a log ----
+let LAST_RULEFILE='';   // known-good runset last prefilled from (for the failure-debug diff)
 $('#prefillbtn').onclick=doPrefill;
 async function doPrefill(){
   const p=$('#prefillpath').value.trim();
   if(!p){$('#prefillmsg').textContent='enter a path';return null;}
   $('#prefillmsg').textContent='reading...';
   const d=await jget('/api/prefill?path='+encodeURIComponent(p));
+  LAST_RULEFILE = d.rulefile || '';   // set when the pasted file was an SVRF rule file
   if(d.tool){$$('input[name=tool]').forEach(r=>r.checked=(r.value===d.tool));
     $('#lvsonly').classList.toggle('hidden',d.tool!=='lvs');}
   if(d.lib)$('#lib').value=d.lib;
@@ -2927,6 +3014,7 @@ window.addEventListener('touchmove',()=>{FOLLOW_LOG=false;},{passive:true});
 async function runCurrentForm(){
   const body={tool:currentTool(),lib:$('#lib').value,cell:$('#cell').value,view:$('#view').value,
     deck:$('#deck').value,src_net:$('#srcnet').value,src_view:$('#srcview').value,
+    runset_src:LAST_RULEFILE,   // pass the prefilled runset so a failure prints a diff vs it
     existing_gds:$('#existinggds').value};
   if(!body.cell){$('#runmsg').textContent='pick a cell (or use an existing GDS)';return false;}
   if(!body.existing_gds && (!body.lib||!body.view)){$('#runmsg').textContent='pick lib/cell/view, or set an existing GDS';return false;}
