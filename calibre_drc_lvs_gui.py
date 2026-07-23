@@ -195,7 +195,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 40      # incremental build number, shown top-right in the GUI
+APP_REVISION = 41      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1980,6 +1980,21 @@ def run_job(job):
                 if not os.path.isfile(src_net_abs):
                     sys.stdout.write("   -I- given src_net not found: %s -- will auto-search\n" % src_net_abs)
                     src_net_abs = ""
+            # 1b) the SOURCE netlist from the runset we were prefilled from (the
+            #     known-good one) -- reuse it instead of regenerating, so a plain
+            #     "Run" gives the same result as "GO"/verbatim. Only when that
+            #     runset is for THIS cell (else it belongs to a different cell).
+            if not src_net_abs:
+                rs = (job.meta.get("runset_src") or "").strip()
+                if rs and os.path.isfile(rs):
+                    _p = _parse_rule_file(rs) or {}
+                    if (_p.get("cell") or "") == cell:
+                        sp = _p.get("source_path") or ""
+                        if sp and os.path.isfile(sp):
+                            src_net_abs = sp
+                            sys.stdout.write("   -I- reusing known-good source netlist from the "
+                                             "prefilled runset (matches GO): %s\n" % sp)
+                            sys.stdout.flush()
             # 2) a <cell>.src.net already sitting next to the layout / run dir
             if not src_net_abs:
                 cand = os.path.join(run_dir, "%s.src.net" % cell)
@@ -2896,6 +2911,7 @@ $('#cell').addEventListener('change',()=>{loadViews();});
 
 // ---- prefill from a log ----
 let LAST_RULEFILE='';   // known-good runset last prefilled from (for the failure-debug diff)
+let PREFILL_CELL='';    // the cell that prefill populated (to detect a real cell change)
 $('#prefillbtn').onclick=doPrefill;
 async function doPrefill(){
   const p=$('#prefillpath').value.trim();
@@ -2903,6 +2919,7 @@ async function doPrefill(){
   $('#prefillmsg').textContent='reading...';
   const d=await jget('/api/prefill?path='+encodeURIComponent(p));
   LAST_RULEFILE = d.rulefile || '';   // set when the pasted file was an SVRF rule file
+  PREFILL_CELL = d.cell || '';
   if(d.tool){$$('input[name=tool]').forEach(r=>r.checked=(r.value===d.tool));
     $('#lvsonly').classList.toggle('hidden',d.tool!=='lvs');}
   if(d.lib)$('#lib').value=d.lib;
@@ -2934,7 +2951,11 @@ function esc0(s){return s;} // msg already safe-ish; keep simple
 // GDS + source-netlist (they were for the prefilled cell) so the new cell streams
 // and netlists its own. The runset template (LAST_RULEFILE) still applies.
 $('#cell').addEventListener('input',()=>{
-  if(LAST_RULEFILE && ($('#existinggds').value || $('#srcnet').value)){
+  // only when the cell REALLY changed away from the prefilled one -- a same-cell
+  // edit must keep the golden GDS + source netlist (else "Run" regenerates and
+  // can differ from "GO").
+  if(LAST_RULEFILE && $('#cell').value.trim()!==PREFILL_CELL
+     && ($('#existinggds').value || $('#srcnet').value)){
     $('#existinggds').value=''; $('#srcnet').value='';
     $('#runmsg').innerHTML='cell changed &mdash; cleared the prefilled GDS + source netlist so '+
       '<b>'+esc($('#cell').value||'?')+'</b> streams &amp; netlists its own (the runset template still applies). '+
