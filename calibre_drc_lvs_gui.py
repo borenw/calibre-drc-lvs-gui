@@ -195,7 +195,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 44      # incremental build number, shown top-right in the GUI
+APP_REVISION = 45      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -2696,10 +2696,12 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div style="flex:0 0 auto;display:flex;align-items:flex-end;gap:8px">
         <button class="sec" id="prefillbtn">Prefill</button>
+        <button class="sec" id="rememberprefill" title="Save this path in your LOCAL calibre_gui_config.json (gitignored, never committed) so it auto-fills next time and is reused for LVS runs">&#9733; Remember</button>
         <button class="sec" id="searchtoggle">Search logs&hellip;</button>
       </div>
     </div>
     <div id="prefillmsg" class="muted" style="margin-top:6px"></div>
+    <div class="muted" style="font-size:11px;margin-top:2px">&#9733; Remember saves the path to your local <code>calibre_gui_config.json</code> (gitignored) &mdash; it auto-fills on the next launch. Clear the box and Remember to forget it.</div>
 
     <div id="searchpanel" class="hidden" style="margin-top:14px;border-top:1px solid var(--line);padding-top:14px">
       <div class="row">
@@ -3029,6 +3031,17 @@ async function doPrefill(){
   return d;
 }
 function esc0(s){return s;} // msg already safe-ish; keep simple
+// Remember the current prefill path in the LOCAL config (gitignored) so it
+// auto-fills next launch and is reused as the LVS runset template.
+$('#rememberprefill').onclick=async()=>{
+  const p=$('#prefillpath').value.trim();
+  const d=await jpost('/api/config',{lvs_runset_template:p});
+  $('#prefillmsg').innerHTML = d.ok
+    ? (p ? 'remembered &mdash; this runset auto-fills next launch and is reused for LVS runs (saved locally in calibre_gui_config.json, not committed)'
+         : 'forgotten &mdash; cleared the saved runset')
+    : '<span class="pill bad">could not save</span> (is calibre_gui_config.json writable?)';
+  setTimeout(()=>{if($('#prefillmsg').textContent.startsWith('remembered')||$('#prefillmsg').textContent.startsWith('forgotten'))$('#prefillmsg').textContent='';},4000);
+};
 // After a prefill-from-runset, if the user hand-edits the cell, clear the stale
 // GDS + source-netlist (they were for the prefilled cell) so the new cell streams
 // and netlists its own. The runset template (LAST_RULEFILE) still applies.
@@ -3697,15 +3710,27 @@ loadRuleFiles();
 loadRecent();
 initStartup();
 async function initStartup(){          // --log paths passed on the command line
-  let d;try{ d=await jget('/api/startup'); }catch(e){ return; }
+  let d;try{ d=await jget('/api/startup'); }catch(e){ d=null; }
   const logs=(d&&d.logs)||[];
-  if(!logs.length)return;
-  $('#prefillpath').value=logs[0];
-  $('#prefillbtn').click();            // prefill Run tab from the first log
-  if(logs.length>=2){                  // preset Compare with the first two
-    $('#cmpPathA').value=logs[0]; $('#cmpPathB').value=logs[1];
-    $('#prefillmsg').innerHTML+=' &bull; 2 logs on command line &mdash; Compare tab preset';
+  if(logs.length){
+    $('#prefillpath').value=logs[0];
+    $('#prefillbtn').click();          // prefill Run tab from the first log
+    if(logs.length>=2){                // preset Compare with the first two
+      $('#cmpPathA').value=logs[0]; $('#cmpPathB').value=logs[1];
+      $('#prefillmsg').innerHTML+=' &bull; 2 logs on command line &mdash; Compare tab preset';
+    }
+    return;
   }
+  // no --log: restore a remembered runset from the LOCAL config and auto-prefill.
+  try{
+    const c=await jget('/api/config');
+    const p=(c&&c.lvs_runset_template||'').trim();
+    if(p && !$('#prefillpath').value.trim()){
+      $('#prefillpath').value=p;
+      $('#prefillbtn').click();
+      $('#prefillmsg').innerHTML+=' &bull; loaded your remembered runset (calibre_gui_config.json)';
+    }
+  }catch(e){}
 }
 </script>
 </body></html>
