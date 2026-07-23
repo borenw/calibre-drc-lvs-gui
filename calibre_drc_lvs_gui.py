@@ -172,6 +172,15 @@ DEFAULT_CONFIG = {
     # Extra SVRF lines injected into the generated runsets (optional).
     "drc_extra_svrf": "",
     "lvs_extra_svrf": "LVS REPORT OPTION NONE\nLVS RECOGNIZE GATES ALL",
+
+    # Known-good LVS runset used as a TEMPLATE for EVERY LVS run: the tool copies
+    # it and rewrites only the cell name + LAYOUT/SOURCE/REPORT paths, preserving
+    # the deck INCLUDEs and all setup (crucially #!tvf / tvf::VERBATIM for TVF
+    # decks, the MASK SVDB spec, LVS REPORT OPTION, #DEFINEs). Point this at a
+    # passing _calibre.lvs_ once and every cell reuses it. Blank -> synthesize a
+    # plain-SVRF runset (fine for plain-SVRF decks). A runset prefilled per-run
+    # takes precedence over this.
+    "lvs_runset_template": _env("LVS_RUNSET_TEMPLATE", ""),
 }
 
 CONFIG_LOCK = threading.Lock()
@@ -179,7 +188,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 37      # incremental build number, shown top-right in the GUI
+APP_REVISION = 38      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1902,32 +1911,42 @@ def run_job(job):
             rc = _run_step(job, "calibre DRC", cmd, run_dir)
             result_file = os.path.join(run_dir, "%s.drc.summary" % cell)
         else:
-            # If this run was prefilled from a known-good runset for THIS cell,
-            # rerun it VERBATIM (preserving #!tvf / tvf::VERBATIM / SVDB spec /
-            # LVS REPORT OPTION / #DEFINE / INCLUDE) instead of synthesizing a
-            # plain-SVRF runset that would drop those and break a TVF deck.
+            # Reuse a known-good runset as a TEMPLATE (preserving #!tvf /
+            # tvf::VERBATIM / SVDB spec / LVS REPORT OPTION / #DEFINE / INCLUDE),
+            # rewriting only the cell name + LAYOUT/SOURCE/REPORT paths. The deck
+            # and TVF scaffolding are cell-independent, so this works for ANY cell
+            # -- not just the cell the runset was originally written for. A
+            # synthesized plain-SVRF runset would drop those and break a TVF deck.
+            # Priority: the runset prefilled for this run, else a configured
+            # lvs_runset_template that applies to every LVS run.
             runset_src = (job.meta.get("runset_src") or "").strip()
-            verbatim = False
-            if runset_src and os.path.isfile(runset_src):
-                _prim = _parse_rule_file(runset_src) or {}
-                if _prim.get("tool") == "lvs" and (_prim.get("cell") or "") == cell:
-                    verbatim = True
-                elif _prim.get("cell") and _prim.get("cell") != cell:
-                    sys.stdout.write("   -I- runset_src is for cell %r, not %r -- "
-                                     "generating a fresh runset instead\n" % (_prim.get("cell"), cell))
-                    sys.stdout.flush()
-            if verbatim:
-                deck = (_parse_rule_file(runset_src) or {}).get("deck") or job.meta.get("deck")
-                runfile, changes = _write_lvs_runset_verbatim(run_dir, cell, gds, src_net, runset_src)
+            tmpl = ""
+            for cand in (runset_src, (cfg.get("lvs_runset_template") or "").strip()):
+                if cand and os.path.isfile(cand):
+                    _p = _parse_rule_file(cand) or {}
+                    if _p.get("tool") == "lvs" or _p.get("source_path") \
+                            or ".lvs" in os.path.basename(cand).lower():
+                        tmpl = cand
+                        break
+            if tmpl:
+                _p = _parse_rule_file(tmpl) or {}
+                deck = _p.get("deck") or job.meta.get("deck")
+                runfile, changes = _write_lvs_runset_verbatim(run_dir, cell, gds, src_net, tmpl)
+                same = (_p.get("cell") or "") == cell
+                how = ("VERBATIM rerun of known-good runset"
+                       if same else
+                       "known-good runset used as a TEMPLATE (originally cell %r)" % (_p.get("cell") or "?"))
+                origin = "prefilled" if tmpl == runset_src else "config lvs_runset_template"
                 sys.stdout.write(
-                    "   -I- VERBATIM rerun of known-good runset:\n"
+                    "   -I- %s  [%s]\n"
                     "       source : %s\n"
+                    "       for cell: %s\n"
                     "       kept   : #!tvf / tvf::VERBATIM / MASK SVDB spec / LVS REPORT OPTION / #DEFINE / INCLUDE\n"
-                    "       rewrote: %s\n" % (runset_src, "; ".join(changes) or "(nothing)"))
+                    "       rewrote: %s\n" % (how, origin, tmpl, cell, "; ".join(changes) or "(nothing)"))
                 sys.stdout.flush()
-                _log(job, "### VERBATIM rerun from %s\n### rewrote: %s\n"
-                     % (runset_src, "; ".join(changes)))
-                _artifact("runset (verbatim)", runfile)
+                _log(job, "### %s (%s) for cell %s\n### source: %s\n### rewrote: %s\n"
+                     % (how, origin, cell, tmpl, "; ".join(changes)))
+                _artifact("runset (from template)", runfile)
                 if deck:
                     _artifact("deck (from runset)", deck)
             else:
@@ -2778,6 +2797,17 @@ async function doPrefill(){
   return d;
 }
 function esc0(s){return s;} // msg already safe-ish; keep simple
+// After a prefill-from-runset, if the user hand-edits the cell, clear the stale
+// GDS + source-netlist (they were for the prefilled cell) so the new cell streams
+// and netlists its own. The runset template (LAST_RULEFILE) still applies.
+$('#cell').addEventListener('input',()=>{
+  if(LAST_RULEFILE && ($('#existinggds').value || $('#srcnet').value)){
+    $('#existinggds').value=''; $('#srcnet').value='';
+    $('#runmsg').innerHTML='cell changed &mdash; cleared the prefilled GDS + source netlist so '+
+      '<b>'+esc($('#cell').value||'?')+'</b> streams &amp; netlists its own (the runset template still applies). '+
+      'Set <b>lib/view</b> if streaming out.';
+  }
+});
 
 // ---- existing runsets (reuse a prior DRC/LVS setup) ----
 $('#rulerefresh').onclick=loadRuleFiles;
@@ -3394,7 +3424,8 @@ const CFG_LABELS={
   easy_skip_cells:'Easy: skip these designs when auto-picking (e.g. chipTop)',
   sim_user:'sim user for log search (blank = login name)',
   sim_roots:'log-search roots ({user} expands)',
-  drc_extra_svrf:'extra DRC SVRF lines',lvs_extra_svrf:'extra LVS SVRF lines'};
+  drc_extra_svrf:'extra DRC SVRF lines',lvs_extra_svrf:'extra LVS SVRF lines',
+  lvs_runset_template:'known-good LVS runset reused as a template for every cell (e.g. a TVF _calibre.lvs_)'};
 async function loadConfig(){
   const c=await jget('/api/config');const box=$('#cfgfields');box.innerHTML='';
   Object.keys(CFG_LABELS).forEach(k=>{

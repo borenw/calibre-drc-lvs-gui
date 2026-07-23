@@ -158,6 +158,7 @@ Nothing site-specific is baked into the script. Keys (all editable in the Config
 | `techlib` / `layermap` | `<tech_lib>` / `.../stream.layermap` | stream-out settings |
 | `drc_deck` / `lvs_deck` | deck file paths | INCLUDEd by the generated runset |
 | `drc_deck_glob` / `lvs_deck_glob` | `.../DECK.*` | newest match auto-selected |
+| `lvs_runset_template` | a passing `_calibre.lvs_` | reuse this runset verbatim for **every** LVS cell (keeps `#!tvf` / TVF setup); rewrites only cell + paths |
 | `netlist_mode` | `si` | LVS source-netlist generator: `si` / `skill` / `custom` / `off` |
 | `netlist_view` | `schematic` | **schematic** view netlisted for the LVS source |
 | `si_bin` / `virtuoso_bin` | `si` / `virtuoso` | netlister executables (ship with Virtuoso) |
