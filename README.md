@@ -8,26 +8,29 @@ Cadence tools run **in the same shell environment you launched from** (licenses,
 No Flask, no pip installs — Python 3.6+ standard library only. The whole app is a
 **single file**, so installing = downloading that one file.
 
-## Install & run — one command
+## Install, then run — two one-liners
 
-Copy this (use the 📋 button on the box), paste in your terminal, press Enter:
+Each box below has a one-click **📋 copy** button (hover the box, top-right corner) — that's the "click" for a terminal command: click 📋, paste, press Enter.
+
+**1 · Install** — download the single script into the current folder:
 
 ```bash
-curl -fsSL -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/borenw/calibre-drc-lvs-gui/contents/calibre_drc_lvs_gui.py?ref=main" -o calibre_drc_lvs_gui.py && python3 calibre_drc_lvs_gui.py --open
+curl -fsSL -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/borenw/calibre-drc-lvs-gui/contents/calibre_drc_lvs_gui.py?ref=main" -o calibre_drc_lvs_gui.py
 ```
 
-That's it — it downloads the script and opens the GUI in your browser. This uses the
-**GitHub API** endpoint, which is always current (the plain `raw.githubusercontent.com`
-URL is CDN-cached for ~5 min and can lag right after a push). Run it from a shell where
-your Calibre/Cadence modules are set up, **or** click **Load modules** in the app once
-it opens.
+<sub>No terminal? Click **[⬇ calibre_drc_lvs_gui.py](https://github.com/borenw/calibre-drc-lvs-gui/raw/main/calibre_drc_lvs_gui.py)** to open the raw file, then **File → Save As** `calibre_drc_lvs_gui.py` into your working folder — or download the whole repo as a **[⬇ ZIP](https://github.com/borenw/calibre-drc-lvs-gui/archive/refs/heads/main.zip)**.</sub>
 
-**To update later**, re-run the exact same command, then **restart the server** (the
-`rev N` shown top-right in the GUI is the *running* process's version, not the file on
-disk). Confirm the badge matches the latest commit:
-https://github.com/borenw/calibre-drc-lvs-gui/commits/main
+**2 · Run** — launch the GUI (opens it in your browser):
 
-<sub>Prefer a helper script? `curl -fsSL -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/borenw/calibre-drc-lvs-gui/contents/install.sh?ref=main" | bash`</sub>
+```bash
+python3 calibre_drc_lvs_gui.py --open
+```
+
+Run step 2 from a shell where your Calibre/Cadence modules are set up, **or** click **Load modules** in the app once it opens. Install uses the **GitHub API** endpoint, which is always current (the plain `raw.githubusercontent.com` URL is CDN-cached for ~5 min and can lag right after a push).
+
+**To update later**, re-run step 1, then **restart the server** (the `rev N` shown top-right in the GUI is the *running* process's version, not the file on disk). Confirm it matches the latest commit: https://github.com/borenw/calibre-drc-lvs-gui/commits/main
+
+<sub>Prefer one command? Chain them: `curl -fsSL -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/borenw/calibre-drc-lvs-gui/contents/calibre_drc_lvs_gui.py?ref=main" -o calibre_drc_lvs_gui.py && python3 calibre_drc_lvs_gui.py --open` &nbsp;·&nbsp; Or a helper script: `curl -fsSL -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/borenw/calibre-drc-lvs-gui/contents/install.sh?ref=main" | bash`</sub>
 
 ## Why a local server (not just an `.html` file)
 
