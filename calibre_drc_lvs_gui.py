@@ -195,7 +195,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 42      # incremental build number, shown top-right in the GUI
+APP_REVISION = 43      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -2500,11 +2500,16 @@ class Handler(BaseHTTPRequestHandler):
         cell = body.get("cell")
         view = body.get("view")
         existing_gds = body.get("existing_gds", "").strip()
+        # a known-good runset (with a layout .db it points at) can stand in for
+        # lib/view -- its original layout + source are reused instead of streaming.
+        runset_src = body.get("runset_src", "").strip()
+        has_runset_layout = bool(runset_src and os.path.isfile(runset_src)
+                                 and (_parse_rule_file(runset_src) or {}).get("layout_path"))
         if tool not in ("drc", "lvs") or not cell:
             return self._send_json({"error": "need tool(drc|lvs) and cell"}, 400)
-        if not existing_gds and not (lib and view):
+        if not existing_gds and not (lib and view) and not has_runset_layout:
             return self._send_json(
-                {"error": "need lib and view (or provide an existing GDS)"}, 400)
+                {"error": "need lib and view (or an existing GDS, or a prefilled runset)"}, 400)
         with CONFIG_LOCK:
             cfg_snap = dict(CONFIG)
         meta = {
