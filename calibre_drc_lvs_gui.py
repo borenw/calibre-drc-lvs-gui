@@ -179,7 +179,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 34      # incremental build number, shown top-right in the GUI
+APP_REVISION = 35      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -2288,8 +2288,9 @@ INDEX_HTML = r"""<!doctype html>
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
       <button id="easybtn" class="gobtn">GO</button>
       <span class="muted" style="font-size:12px;max-width:640px">
-        Loads the required modules &rarr; finds your most recent DRC log &rarr; re-runs DRC on that
-        design with the latest rule deck &rarr; shows a live progress bar with %% and ETA below.</span>
+        Loads modules &rarr; if you've pasted a log/runset in <b>Prefill</b> above (e.g. a
+        Calibre <code>_calibre.lvs_</code>), re-runs <b>that</b>; otherwise finds your most
+        recent DRC log &rarr; re-runs it &rarr; live progress bar with %% and ETA below.</span>
     </div>
     <div id="easymsg" class="muted" style="margin-top:8px"></div>
   </div>
@@ -2593,9 +2594,10 @@ $('#lib').addEventListener('change',()=>{loadCells();});
 $('#cell').addEventListener('change',()=>{loadViews();});
 
 // ---- prefill from a log ----
-$('#prefillbtn').onclick=async()=>{
+$('#prefillbtn').onclick=doPrefill;
+async function doPrefill(){
   const p=$('#prefillpath').value.trim();
-  if(!p){$('#prefillmsg').textContent='enter a path';return;}
+  if(!p){$('#prefillmsg').textContent='enter a path';return null;}
   $('#prefillmsg').textContent='reading...';
   const d=await jget('/api/prefill?path='+encodeURIComponent(p));
   if(d.tool){$$('input[name=tool]').forEach(r=>r.checked=(r.value===d.tool));
@@ -2622,7 +2624,8 @@ $('#prefillbtn').onclick=async()=>{
   if(d.lib_candidates)msg+='  &mdash; cell in multiple libs: '+d.lib_candidates.join(', ');
   if(d.notes&&d.notes.length)msg+='  ['+d.notes.join('; ')+']';
   $('#prefillmsg').innerHTML=esc0(msg);
-};
+  return d;
+}
 function esc0(s){return s;} // msg already safe-ish; keep simple
 
 // ---- existing runsets (reuse a prior DRC/LVS setup) ----
@@ -2707,6 +2710,25 @@ async function easyRun(){
   const b=$('#easybtn'), set=m=>$('#easymsg').innerHTML=m;
   b.disabled=true;
   try{
+    // If a specific log/runset is staged in the Prefill box, GO reruns THAT
+    // (prefill -> run the current form) instead of auto-picking the latest DRC.
+    // This is what makes "paste _calibre.lvs_ -> Prefill -> GO" rerun that LVS.
+    const staged=$('#prefillpath').value.trim();
+    if(staged){
+      set('<span class="spinner"></span>ensuring tools / loading modules&hellip;');
+      let env=await jget('/api/envcheck');
+      if(!env.ok){ const r=await jpost('/api/loadmodules',{}); env=r.status||await jget('/api/envcheck'); }
+      renderEnvBanner(env);
+      set('<span class="spinner"></span>prefilling from <b>'+esc(staged.split('/').pop())+'</b>&hellip;');
+      const pf=await doPrefill();
+      if(!pf||!pf.cell){ set('<span class="pill warn">could not read a design</span> from that path &mdash; is it a Calibre result / runset (e.g. _calibre.lvs_)?'); return; }
+      set('<span class="spinner"></span>rerunning <b>'+esc((pf.tool||'').toUpperCase())+'</b> on <b>'+esc(pf.cell)+'</b>&hellip;');
+      const ok=await runCurrentForm();
+      set(ok
+        ? 'rerunning <b>'+esc((pf.tool||'').toUpperCase())+'</b> on <b>'+esc(pf.cell)+'</b> from <b>'+esc(staged.split('/').pop())+'</b> &mdash; progress below &#8595;'
+        : '<span class="pill warn">could not launch</span> &mdash; see the note under the Run button (a rule file carries no view: keep the existing-GDS box, or set a view).');
+      return;
+    }
     // 1) ensure tools on PATH (auto module load)
     set('<span class="spinner"></span>step 1/4 &mdash; checking environment / loading modules&hellip;');
     let env=await jget('/api/envcheck');
@@ -2902,23 +2924,25 @@ function startRunUI(){ RESULT_SCROLLED=false; FOLLOW_LOG=true;
 // if the user scrolls up during a run, stop auto-following
 window.addEventListener('wheel',()=>{FOLLOW_LOG=false;},{passive:true});
 window.addEventListener('touchmove',()=>{FOLLOW_LOG=false;},{passive:true});
-$('#runbtn').onclick=async()=>{
+async function runCurrentForm(){
   const body={tool:currentTool(),lib:$('#lib').value,cell:$('#cell').value,view:$('#view').value,
     deck:$('#deck').value,src_net:$('#srcnet').value,src_view:$('#srcview').value,
     existing_gds:$('#existinggds').value};
-  if(!body.cell){$('#runmsg').textContent='pick a cell (or use an existing GDS)';return;}
-  if(!body.existing_gds && (!body.lib||!body.view)){$('#runmsg').textContent='pick lib/cell/view, or set an existing GDS';return;}
+  if(!body.cell){$('#runmsg').textContent='pick a cell (or use an existing GDS)';return false;}
+  if(!body.existing_gds && (!body.lib||!body.view)){$('#runmsg').textContent='pick lib/cell/view, or set an existing GDS';return false;}
   $('#runbtn').disabled=true;$('#runmsg').textContent='launching...';
   const d=await jpost('/api/run',body);
   $('#runbtn').disabled=false;
-  if(d.error){$('#runmsg').textContent='ERROR: '+d.error;return;}
+  if(d.error){$('#runmsg').textContent='ERROR: '+d.error;return false;}
   $('#runmsg').textContent='job '+d.job_id+'  ('+d.run_dir+')';
   startRunUI();
   $('#livepanel').scrollIntoView({behavior:'smooth',block:'start'});
   if(pollTimer)clearInterval(pollTimer);
   pollTimer=setInterval(()=>pollJob(d.job_id),1200);
   pollJob(d.job_id);
-};
+  return true;
+}
+$('#runbtn').onclick=runCurrentForm;
 function fmtDur(s){s=Math.round(s||0);const m=Math.floor(s/60),ss=s%60;
   return m>0?(m+'m'+(ss<10?'0':'')+ss+'s'):(ss+'s');}
 function renderProgress(d,st){
