@@ -127,6 +127,13 @@ DEFAULT_CONFIG = {
     # Schematic view to netlist for the LVS source (usually "schematic" --
     # NOT the layout view used for strmout).
     "netlist_view": _env("NETLIST_VIEW", "schematic"),
+    # Device / std-cell CDL file(s) that DEFINE subckts the schematic instantiates.
+    # auCdl does NOT emit a `.INCLUDE` for these, so the generated source netlist
+    # gets `.INCLUDE "<path>"` injected for each entry here (newline/comma sep).
+    # Without it LVS fails 'No matching ".SUBCKT" statement for ...'. If blank, the
+    # tool mirrors any `.INCLUDE` from a known-good reference netlist (e.g. the
+    # SOURCE of a prefilled _calibre.lvs_).
+    "netlist_include": _env("NETLIST_INCLUDE", ""),
     # Command templates. {placeholders}: run_dir cell lib netlist_view src_net
     # cdslib si_bin virtuoso_bin skill_script netlist_log calibre_bin.
     "si_cmd": "{si_bin} {run_dir} -batch -command netlist -cdslib {cdslib}",
@@ -188,7 +195,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 39      # incremental build number, shown top-right in the GUI
+APP_REVISION = 40      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1423,6 +1430,75 @@ def _write_netlist_skill(run_dir, lib, cell, view, out_name):
     return ilfile
 
 
+def _known_good_netlist(job, cfg, cell, exclude=""):
+    """A reference (already-passing) source netlist for `cell` whose `.INCLUDE`
+    header lines we can mirror: the prefilled runset's SOURCE PATH, else
+    discover_src_net. Never returns `exclude` (our own just-generated netlist)."""
+    ex = os.path.abspath(exclude) if exclude else ""
+    rs = (job.meta.get("runset_src") or "").strip()
+    if rs and os.path.isfile(rs):
+        sp = (_parse_rule_file(rs) or {}).get("source_path") or ""
+        if sp and os.path.isfile(sp) and os.path.abspath(sp) != ex:
+            return sp
+    try:
+        cand = discover_src_net(cell, cfg)
+        if cand and os.path.abspath(cand) != ex:
+            return cand
+    except Exception:
+        pass
+    return ""
+
+
+def _inject_netlist_includes(job, cfg, cell, netlist_path):
+    """auCdl does NOT emit the device / std-cell `.INCLUDE` header that LVS needs
+    to resolve the subckts the netlist instantiates -- without it LVS fails with
+    'No matching ".SUBCKT" statement for ...'. Ensure the generated CDL carries
+    those `.INCLUDE`s: from config `netlist_include` (explicit) plus any `.INCLUDE`
+    found in a known-good reference netlist. Missing ones are inserted just before
+    the first `.SUBCKT`. Returns the injected list."""
+    wanted = []
+    for x in re.split(r"[\n,]+", cfg.get("netlist_include", "") or ""):
+        x = x.strip().strip('"')
+        if x and x not in wanted:
+            wanted.append(x)
+    ref = _known_good_netlist(job, cfg, cell, exclude=netlist_path)
+    if ref:
+        try:
+            with open(ref, "r", errors="replace") as f:
+                for ln in f:
+                    m = re.match(r'\s*\.INCLUDE\s+(.+?)\s*$', ln, re.I)
+                    if m:
+                        inc = m.group(1).strip().strip('"')
+                        if inc and inc not in wanted:
+                            wanted.append(inc)
+        except Exception:
+            pass
+    if not wanted:
+        return []
+    try:
+        with open(netlist_path, "r", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return []
+    have = set(m.group(1).strip().strip('"')
+               for m in re.finditer(r'(?im)^\s*\.INCLUDE\s+(.+?)\s*$', text))
+    missing = [w for w in wanted if w not in have]
+    if not missing:
+        return []
+    block = "".join('.INCLUDE "%s"\n' % w for w in missing)
+    m = re.search(r'(?im)^\s*\.SUBCKT\b', text)
+    text = (text[:m.start()] + block + "\n" + text[m.start():]) if m else (block + text)
+    with open(netlist_path, "w") as f:
+        f.write(text)
+    origin = "config netlist_include" if cfg.get("netlist_include") else ("reference %s" % ref)
+    sys.stdout.write("   -I- injected %d missing .INCLUDE line(s) into %s (from %s):\n%s"
+                     % (len(missing), os.path.basename(netlist_path), origin,
+                        "".join("        .INCLUDE \"%s\"\n" % w for w in missing)))
+    sys.stdout.flush()
+    _log(job, "### injected .INCLUDE (%s): %s\n" % (origin, ", ".join(missing)))
+    return missing
+
+
 def _generate_src_net(job, cfg, run_dir, lib, cell, src_view):
     """Generate an LVS source netlist (schematic -> CDL) for lib/cell/src_view
     into run_dir; return the netlist path, or '' if generation is off/failed.
@@ -1487,6 +1563,9 @@ def _generate_src_net(job, cfg, run_dir, lib, cell, src_view):
                 sys.stdout.write("   -I- netlist %s -> %s\n"
                                  % (os.path.basename(cand), out_name))
                 sys.stdout.flush()
+            # auCdl omits the device/std-cell `.INCLUDE` header LVS needs to
+            # resolve instantiated subckts -- add it (else "No matching .SUBCKT").
+            _inject_netlist_includes(job, cfg, cell, out_path)
             return out_path
     return ""
 
@@ -3466,6 +3545,7 @@ const CFG_LABELS={
   strmout_cmd:'strmout command template',drc_cmd:'DRC command template',lvs_cmd:'LVS command template',
   netlist_mode:'LVS source-netlist generator (si | skill | custom | off)',
   netlist_view:'schematic view to netlist for LVS source (default schematic)',
+  netlist_include:'device/std-cell CDL .INCLUDE injected into the generated source netlist (newline/comma sep)',
   si_bin:'si executable (auCDL netlister, ships with Virtuoso)',
   virtuoso_bin:'virtuoso executable (for skill netlist mode)',
   si_cmd:'si auCDL command template',
@@ -3483,7 +3563,7 @@ const CFG_LABELS={
 async function loadConfig(){
   const c=await jget('/api/config');const box=$('#cfgfields');box.innerHTML='';
   Object.keys(CFG_LABELS).forEach(k=>{
-    const big=k.endsWith('_cmd')||k.endsWith('_svrf')||k==='sim_roots';
+    const big=k.endsWith('_cmd')||k.endsWith('_svrf')||k==='sim_roots'||k==='netlist_include';
     const wrap=document.createElement('div');
     wrap.innerHTML='<label>'+esc(CFG_LABELS[k])+' <code>'+k+'</code></label>'+
       (big?'<textarea rows="2" id="cfg_'+k+'"></textarea>':'<input type="text" id="cfg_'+k+'">');
