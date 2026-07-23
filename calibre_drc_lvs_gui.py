@@ -179,7 +179,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 36      # incremental build number, shown top-right in the GUI
+APP_REVISION = 37      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1302,6 +1302,41 @@ def _write_lvs_runset(run_dir, cell, gds, src_net, deck, extra):
     return runfile
 
 
+def _write_lvs_runset_verbatim(run_dir, cell, gds, src_net, src_runset):
+    """Rerun a *known-good* runset (e.g. a Calibre-Interactive `_calibre.lvs_`)
+    VERBATIM: copy it and rewrite ONLY the LAYOUT/SOURCE paths + the LVS REPORT
+    file, preserving everything else -- crucially the `#!tvf` first line,
+    `tvf::VERBATIM { ... }` blocks, the full `MASK SVDB DIRECTORY ... XRC CCI
+    IXF NXF SLPH SI` spec, `LVS REPORT OPTION ...`, every `#DEFINE` and `INCLUDE`.
+    A synthesized plain-SVRF runset drops those and breaks TVF decks (undefined
+    layers). Returns (runfile, changes) where changes lists what was rewritten."""
+    with open(src_runset, "r", errors="replace") as f:
+        text = f.read()
+    changes = []
+
+    def sub(pat, repl_val, label):
+        nonlocal text
+        new, n = re.subn(pat, lambda m: m.group(1) + '"%s"' % repl_val, text,
+                         flags=re.I | re.M)
+        if n:
+            text = new
+            changes.append("%s -> %s (%dx)" % (label, repl_val, n))
+
+    # LAYOUT/SOURCE point at THIS run's artifacts; LVS REPORT lands in the run dir.
+    sub(r'^([ \t]*LAYOUT[ \t]+PATH[ \t]+).*$',    gds,                     "LAYOUT PATH")
+    sub(r'^([ \t]*LAYOUT[ \t]+PRIMARY[ \t]+).*$', cell,                    "LAYOUT PRIMARY")
+    sub(r'^([ \t]*SOURCE[ \t]+PATH[ \t]+).*$',    src_net,                 "SOURCE PATH")
+    sub(r'^([ \t]*SOURCE[ \t]+PRIMARY[ \t]+).*$', cell,                    "SOURCE PRIMARY")
+    # only the `LVS REPORT "<file>"` line (not `LVS REPORT OPTION/MAXIMUM ...`).
+    sub(r'^([ \t]*LVS[ \t]+REPORT[ \t]+)"[^"\n]*"[ \t]*$',
+        "%s.lvs.report" % cell, "LVS REPORT")
+
+    runfile = os.path.join(run_dir, "%s.lvs.rule" % cell)
+    with open(runfile, "w") as f:
+        f.write(text)
+    return runfile, changes
+
+
 def _write_si_env(run_dir, lib, cell, view, out_name):
     """Write a si.env that drives Cadence's auCDL netlister to emit a CDL
     source netlist for lib/cell/view. Read by `si <run_dir> -batch -command
@@ -1867,20 +1902,49 @@ def run_job(job):
             rc = _run_step(job, "calibre DRC", cmd, run_dir)
             result_file = os.path.join(run_dir, "%s.drc.summary" % cell)
         else:
-            deck = job.meta.get("deck") or latest_deck("lvs") or cfg["lvs_deck"]
-            if not deck:                          # nothing configured -> auto-detect
-                found = discover_decks("lvs")
-                if found:
-                    deck = found[0]["deck"]
-                    sys.stdout.write("   deck auto-detected from %s: %s\n" %
-                                     (found[0]["via"], deck))
+            # If this run was prefilled from a known-good runset for THIS cell,
+            # rerun it VERBATIM (preserving #!tvf / tvf::VERBATIM / SVDB spec /
+            # LVS REPORT OPTION / #DEFINE / INCLUDE) instead of synthesizing a
+            # plain-SVRF runset that would drop those and break a TVF deck.
+            runset_src = (job.meta.get("runset_src") or "").strip()
+            verbatim = False
+            if runset_src and os.path.isfile(runset_src):
+                _prim = _parse_rule_file(runset_src) or {}
+                if _prim.get("tool") == "lvs" and (_prim.get("cell") or "") == cell:
+                    verbatim = True
+                elif _prim.get("cell") and _prim.get("cell") != cell:
+                    sys.stdout.write("   -I- runset_src is for cell %r, not %r -- "
+                                     "generating a fresh runset instead\n" % (_prim.get("cell"), cell))
                     sys.stdout.flush()
-            _require_deck(deck, "LVS")
-            _artifact("deck", deck)
-            _artifact("source net", src_net)
-            runfile = _write_lvs_runset(run_dir, cell, gds, src_net, deck,
-                                        cfg.get("lvs_extra_svrf", ""))
-            _artifact("runset", runfile)
+            if verbatim:
+                deck = (_parse_rule_file(runset_src) or {}).get("deck") or job.meta.get("deck")
+                runfile, changes = _write_lvs_runset_verbatim(run_dir, cell, gds, src_net, runset_src)
+                sys.stdout.write(
+                    "   -I- VERBATIM rerun of known-good runset:\n"
+                    "       source : %s\n"
+                    "       kept   : #!tvf / tvf::VERBATIM / MASK SVDB spec / LVS REPORT OPTION / #DEFINE / INCLUDE\n"
+                    "       rewrote: %s\n" % (runset_src, "; ".join(changes) or "(nothing)"))
+                sys.stdout.flush()
+                _log(job, "### VERBATIM rerun from %s\n### rewrote: %s\n"
+                     % (runset_src, "; ".join(changes)))
+                _artifact("runset (verbatim)", runfile)
+                if deck:
+                    _artifact("deck (from runset)", deck)
+            else:
+                deck = job.meta.get("deck") or latest_deck("lvs") or cfg["lvs_deck"]
+                if not deck:                          # nothing configured -> auto-detect
+                    found = discover_decks("lvs")
+                    if found:
+                        deck = found[0]["deck"]
+                        sys.stdout.write("   deck auto-detected from %s: %s\n" %
+                                         (found[0]["via"], deck))
+                        sys.stdout.flush()
+                _require_deck(deck, "LVS")
+                _artifact("deck", deck)
+                _artifact("source net", src_net)
+                runfile = _write_lvs_runset(run_dir, cell, gds, src_net, deck,
+                                            cfg.get("lvs_extra_svrf", ""))
+                _artifact("runset", runfile)
             cmd = _fill(cfg["lvs_cmd"], {"calibre_bin": cfg["calibre_bin"],
                                         "spiceout": "%s.sp" % cell,
                                         "runfile": os.path.basename(runfile)})

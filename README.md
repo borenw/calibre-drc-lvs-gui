@@ -104,6 +104,16 @@ or with environment variables (`CDS_LIB`, `LAYERMAP`, `DRC_DECK`, `DRC_DECK_GLOB
   `*.lvs.rule`) and it additionally recovers the **INCLUDEd deck** and the **`SOURCE`
   netlist**, and offers to **reuse the exact prior GDS** — a one-click, faithful
   rerun of a previous Calibre-Interactive setup.
+- **Verbatim rerun of a known-good runset** — when you prefill from a rule file and
+  rerun the same cell, the tool reruns **that runset verbatim** (rewriting only the
+  `LAYOUT` / `SOURCE` / `LVS REPORT` paths) instead of synthesizing a fresh one. This
+  preserves the `#!tvf` first line, `tvf::VERBATIM { … }` blocks, the full
+  `MASK SVDB DIRECTORY … XRC CCI IXF NXF SLPH SI` spec, `LVS REPORT OPTION …`, and
+  every `#DEFINE` / `INCLUDE` — so **TVF (Tcl) decks** work (a synthesized plain-SVRF
+  runset drops those and fails with "undefined layer name parameter").
+- **Self-diagnosing failures** — if a Calibre run fails (e.g. a deck-compile error),
+  it prints a **DEBUG HELP** block (console + browser log) with the detected error,
+  the runset/deck paths, and ready-to-run `diff` / `grep` / reproduce commands.
 - **Existing runsets reuse** — scans for existing Calibre rule files and lets you
   re-run a prior DRC/LVS setup (layout + cell + deck + source) in one click.
 - **Recently-edited layouts** — suggests the design you were just editing (newest
