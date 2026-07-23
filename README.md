@@ -77,6 +77,13 @@ or with environment variables (`CDS_LIB`, `LAYERMAP`, `DRC_DECK`, `DRC_DECK_GLOB
 | `--config F` | `./calibre_gui_config.json` | config file (persisted from the Config tab) |
 | `--open` | off | try to open a browser |
 | `--log PATH` | — | prefill the Run tab from an existing result log on startup; pass twice to also preset the Compare tab (A/B) |
+| `--lvs PATH` (`--calibre-lvs`) | — | prefill an existing Calibre-Interactive `_calibre.lvs_` runset on startup — reuses its deck, source netlist, and GDS so you can hit **GO** right away |
+
+For example, point the GUI straight at a passing runset:
+
+```bash
+python3 calibre_drc_lvs_gui.py --open --lvs /path/to/_calibre.lvs_
+```
 
 ## Features
 

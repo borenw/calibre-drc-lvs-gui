@@ -195,7 +195,8 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 45      # incremental build number, shown top-right in the GUI
+STARTUP_LVS = ""       # existing _calibre.lvs_ runset passed on the command line (--lvs), prefilled on startup
+APP_REVISION = 46      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -2446,7 +2447,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/envcheck":
                 return self._send_json(env_status())
             if path == "/api/startup":
-                return self._send_json({"logs": STARTUP_LOGS})
+                return self._send_json({"logs": STARTUP_LOGS, "lvs": STARTUP_LVS})
             if path == "/api/debuglog":
                 dl = os.path.join(RUNS_BASE, "gui_debug.log")
                 txt = ""
@@ -3709,9 +3710,20 @@ loadDecks();
 loadRuleFiles();
 loadRecent();
 initStartup();
-async function initStartup(){          // --log paths passed on the command line
+async function initStartup(){          // --lvs / --log paths passed on the command line
   let d;try{ d=await jget('/api/startup'); }catch(e){ d=null; }
+  const lvs=(d&&d.lvs)||'';
   const logs=(d&&d.logs)||[];
+  if(lvs){                             // --lvs: prefill the given _calibre.lvs_ runset
+    $('#prefillpath').value=lvs;
+    $('#prefillbtn').click();          // reuses its deck + source netlist + GDS -> ready to GO
+    $('#prefillmsg').innerHTML+=' &bull; _calibre.lvs_ from command line (--lvs)';
+    if(logs.length>=2){                // any two --log paths still preset Compare
+      $('#cmpPathA').value=logs[0]; $('#cmpPathB').value=logs[1];
+      $('#prefillmsg').innerHTML+=' &bull; 2 logs on command line &mdash; Compare tab preset';
+    }
+    return;
+  }
   if(logs.length){
     $('#prefillpath').value=logs[0];
     $('#prefillbtn').click();          // prefill Run tab from the first log
@@ -3771,10 +3783,17 @@ def main():
     ap.add_argument("--log", action="append", metavar="PATH", default=[],
                     help="existing result log (.drc.summary/.lvs.report/...) to "
                          "prefill on startup; repeat once more to preset a compare")
+    ap.add_argument("--lvs", "--calibre-lvs", dest="lvs", metavar="PATH", default=None,
+                    help="path to an existing Calibre-Interactive _calibre.lvs_ runset; "
+                         "prefill it on startup (reuses its deck, source netlist, and GDS) "
+                         "so you can hit GO right away")
     args = ap.parse_args()
 
-    global STARTUP_LOGS
+    global STARTUP_LOGS, STARTUP_LVS
     STARTUP_LOGS = [os.path.abspath(os.path.expanduser(p)) for p in (args.log or [])]
+    STARTUP_LVS = os.path.abspath(os.path.expanduser(args.lvs)) if args.lvs else ""
+    if STARTUP_LVS and not os.path.isfile(STARTUP_LVS):
+        sys.stderr.write("WARNING: --lvs path does not exist: %s\n" % STARTUP_LVS)
 
     CONFIG_PATH = os.path.abspath(args.config)
     CONFIG = load_config(CONFIG_PATH)
@@ -3817,6 +3836,8 @@ def main():
     print("   runs dir  : %s" % RUNS_BASE)
     print("   config    : %s" % CONFIG_PATH)
     print("   cds.lib   : %s" % (resolve_cds_lib() or "(none found -- set cds_lib or launch from your project dir)"))
+    if STARTUP_LVS:
+        print("   --lvs     : %s" % STARTUP_LVS)
     if STARTUP_LOGS:
         print("   --log     : %s" % ", ".join(STARTUP_LOGS))
     print("   NOTE: Calibre/strmout inherit THIS shell's environment.")
