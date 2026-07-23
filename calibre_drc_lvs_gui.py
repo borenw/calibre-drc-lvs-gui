@@ -195,7 +195,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 41      # incremental build number, shown top-right in the GUI
+APP_REVISION = 42      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1876,6 +1876,24 @@ def _debug_help(job, tool, run_dir, runfile, deck, runset_src, src_net=None):
         L.append("#       or is excluded by simStopList -- check the netlister log:")
         L.append("sed -n '1,60p' %s" % q(os.path.join(run_dir, "netlist_%s.log" % cell)))
 
+    # ---- layout / strmout hint (fresh GDS fails but the original .db passes?) ----
+    if tool == "lvs":
+        strm = next((s for s in job.steps if "strmout" in (s.get("name") or "")), None)
+        if strm:
+            lm = cfg.get("layermap") or "(blank -> auto-detected; see the strmout log)"
+            L.append("")
+            L.append("# ---- layout / strmout ----")
+            L.append("# device/net mismatches can come from the freshly-streamed GDS: if the")
+            L.append("# ORIGINAL .calibre.db passes but this one fails, it's a layer-map /")
+            L.append("# strmout-options mismatch. layermap used for this stream-out:")
+            L.append("#   %s" % lm)
+            L.append("# fix: reuse the original layout (put its .calibre.db in 'Existing GDS',")
+            L.append("#      or prefill the passing _calibre.lvs_ -- rev41+ auto-reuses its")
+            L.append("#      LAYOUT DB), or point 'layermap' in Config at the deck's map file.")
+            L.append("# this run's strmout command + log:")
+            L.append("grep -A1 strmout %s ; sed -n '1,40p' %s" %
+                     (q(job.log_path), q(os.path.join(run_dir, "strmout_%s.log" % cell))))
+
     L.append("# 4) reproduce the exact Calibre run by hand (env must be module-loaded):")
     L.append("cd %s && %s" % (q(run_dir), repro))
     L.append("# 5) the full log:")
@@ -1919,11 +1937,37 @@ def run_job(job):
         gds = "%s.calibre.db" % cell
         gds_abs = os.path.join(run_dir, gds)
 
-        # --- 1. stream out GDS from OA (unless user supplied an existing GDS) ---
-        phase("Layout: %s" % ("use existing GDS" if job.meta.get("existing_gds")
+        # --- 1. stream out GDS from OA (unless we have a known-good layout DB) ---
+        existing_gds = (job.meta.get("existing_gds") or "").strip()
+        # If prefilled from a known-good runset for THIS cell, reuse the ORIGINAL
+        # layout .db it points at (LAYOUT PATH) instead of re-streaming: a fresh
+        # strmout can differ (layer map / options) and fail LVS even though the
+        # original passed. Mirrors the golden source-netlist reuse.
+        if not existing_gds and tool == "lvs":
+            rs = (job.meta.get("runset_src") or "").strip()
+            if rs and os.path.isfile(rs):
+                _p = _parse_rule_file(rs) or {}
+                if (_p.get("cell") or "") == cell:
+                    lp = (_p.get("layout_path") or "").strip().strip('"')
+                    cands = []
+                    if lp:
+                        cands.append(lp if os.path.isabs(lp)
+                                     else os.path.join(os.path.dirname(os.path.abspath(rs)), lp))
+                        cands.append(os.path.join(os.path.dirname(os.path.abspath(rs)),
+                                                  os.path.basename(lp)))
+                    for c in cands:
+                        if c and os.path.isfile(c):
+                            existing_gds = c
+                            sys.stdout.write("   -I- reusing known-good layout DB from the prefilled "
+                                             "runset (matches the original pass): %s\n" % c)
+                            sys.stdout.write("       (this verifies THAT layout, not a fresh strmout "
+                                             "of the current OA cellview)\n")
+                            sys.stdout.flush()
+                            break
+        phase("Layout: %s" % ("use existing GDS" if existing_gds
                               else "stream out from OpenAccess (strmout)"))
-        if job.meta.get("existing_gds"):
-            src = os.path.abspath(os.path.expanduser(job.meta["existing_gds"]))
+        if existing_gds:
+            src = os.path.abspath(os.path.expanduser(existing_gds))
             _log(job, "Using existing GDS: %s\n" % src)
             if not os.path.isfile(src):
                 raise RuntimeError("existing GDS not found: %s" % src)
