@@ -188,7 +188,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 38      # incremental build number, shown top-right in the GUI
+APP_REVISION = 39      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -1677,20 +1677,24 @@ def _ensure_tools(job, cfg, tools):
          ", ".join("%s=%s" % (t, shutil.which(_bin_for(cfg, t))) for t in tools))
 
 
-def _scan_calibre_errors(log_path, max_lines=600):
-    """Pull the salient Calibre compile/runtime error lines from the tail of a run
-    log, plus any 'undefined layer name parameter: X' layer names it complains
-    about. Returns (error_lines, undefined_layers)."""
+def _scan_calibre_errors(log_path, max_lines=800):
+    """Scan the tail of a run log for salient Calibre errors. Returns a dict:
+      errs    -> notable error lines
+      layers  -> undefined layer names  ('undefined layer name parameter: X')
+      subckts -> [(name, netlist_file)] for a source-netlist gap
+                 ('No matching ".SUBCKT" statement for "X" ... in the file "F"')"""
     try:
         with open(log_path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()[-max_lines:]
     except Exception:
-        return [], []
-    errs, layers, seen = [], [], set()
+        return {"errs": [], "layers": [], "subckts": []}
+    errs, layers, subckts, seen = [], [], [], set()
     err_re = re.compile(r"undefined layer|unrecognized|not defined|isn'?t defined|"
-                        r"problem with access|syntax error|\*error\*|^error|"
-                        r"\berror\b.*line\s+\d+", re.I)
-    lyr_re = re.compile(r"undefined layer name parameter:\s*([A-Za-z0-9_]+)", re.I)
+                        r"no matching|problem with access|syntax error|\*error\*|"
+                        r"^error|\berror\b.*line\s+\d+|cannot find|missing", re.I)
+    lyr_re = re.compile(r"undefined layer name parameter:\s*([A-Za-z0-9_./]+)", re.I)
+    sub_re = re.compile(r'no matching\s+"?\.?SUBCKT"?\s+statement\s+for\s+"?([^"\s]+)"?'
+                        r'(?:.*?in the file\s+"?([^"\n]+?)"?\s*)?$', re.I)
     for ln in lines:
         s = ln.strip()
         if s and err_re.search(s) and s not in seen:
@@ -1699,20 +1703,27 @@ def _scan_calibre_errors(log_path, max_lines=600):
         m = lyr_re.search(ln)
         if m and m.group(1) not in layers:
             layers.append(m.group(1))
-    return errs[-20:], layers
+        m = sub_re.search(s)
+        if m:
+            pair = (m.group(1), (m.group(2) or "").strip())
+            if pair not in subckts:
+                subckts.append(pair)
+    return {"errs": errs[-20:], "layers": layers, "subckts": subckts}
 
 
-def _debug_help(job, tool, run_dir, runfile, deck, runset_src):
+def _debug_help(job, tool, run_dir, runfile, deck, runset_src, src_net=None):
     """On a Calibre failure, print a copy/paste debug block -- to the console AND
-    the run log (so it shows in the browser log view too): the generated runset,
-    the deck, detected errors, and ready-to-run `diff` / `grep` / reproduce
-    commands. `runset_src` is the known-good runset the run was prefilled from
-    (or None), so we can hand the user an exact diff to read back."""
+    the run log (so it shows in the browser log view too): the runset, the deck,
+    detected errors, and ready-to-run diff/grep/reproduce commands. For an LVS
+    source-netlist gap (missing .SUBCKT) it also diffs the generated netlist vs a
+    known-good one and lists which subckts are missing."""
     q = shlex.quote
     cell = job.meta.get("cell", "")
-    calibre = job.meta.get("cfg_snapshot", {}).get("calibre_bin") or "calibre"
+    cfg = job.meta.get("cfg_snapshot", {})
+    calibre = cfg.get("calibre_bin") or "calibre"
     deckdir = os.path.dirname(deck) if deck else ""
-    errs, layers = _scan_calibre_errors(job.log_path)
+    info = _scan_calibre_errors(job.log_path)
+    errs, layers, subckts = info["errs"], info["layers"], info["subckts"]
     base = os.path.basename(runfile) if runfile else ""
     repro = ("%s -lvs -hier -spice %s.sp %s" % (calibre, cell, q(base))) if tool == "lvs" \
         else ("%s -drc -hier -turbo %s" % (calibre, q(base)))
@@ -1724,6 +1735,8 @@ def _debug_help(job, tool, run_dir, runfile, deck, runset_src):
          "deck INCLUDEd    : %s" % (deck or "(none)"),
          "run directory    : %s" % run_dir,
          "full run log     : %s" % job.log_path]
+    if src_net:
+        L.append("source netlist   : %s" % src_net)
     if runset_src:
         L.append("known-good runset: %s%s" % (runset_src,
                  "" if os.path.isfile(runset_src) else "   (NOT FOUND)"))
@@ -1735,7 +1748,7 @@ def _debug_help(job, tool, run_dir, runfile, deck, runset_src):
     L.append("# ---------- copy/paste commands ----------")
     if runset_src and os.path.isfile(runset_src):
         L.append("# 1) diff the GUI-generated runset vs your known-good runset")
-        L.append("#    (the KEY comparison -- shows any #DEFINE / INCLUDE / option we dropped):")
+        L.append("#    (shows any #DEFINE / INCLUDE / option / #!tvf we dropped):")
         L.append("diff -u %s %s" % (q(runset_src), q(runfile)))
     else:
         L.append("# 1) show the runset the GUI generated (paste it back to me):")
@@ -1744,9 +1757,49 @@ def _debug_help(job, tool, run_dir, runfile, deck, runset_src):
         L.append("# 2) find where layer '%s' is supposed to be derived in the deck tree:" % lyr)
         L.append("grep -rniE %s %s | head -30" %
                  (q(r"\b%s\b" % lyr), q(deckdir or "<deck-dir>")))
-    L.append("# 3) reproduce the exact Calibre run by hand (env must be module-loaded):")
+
+    # ---- LVS source-netlist gap (missing .SUBCKT) ----
+    if tool == "lvs" and (subckts or src_net):
+        netlist = src_net or ""
+        for _n, _f in subckts:
+            if _f:
+                netlist = _f
+                break
+        L.append("")
+        L.append("# ---- LVS source-netlist diagnostics ----")
+        if netlist:
+            L.append("# how many .SUBCKT definitions vs X-instance references are in the netlist:")
+            L.append("grep -c '^\\.SUBCKT' %s ; grep -c '^X' %s" % (q(netlist), q(netlist)))
+        for name, _f in subckts:
+            nf = _f or netlist or "<netlist>"
+            L.append("# subckt '%s' is instantiated but never defined -- show both uses:" % name)
+            L.append("grep -niE %s %s" %
+                     (q(r"(\.SUBCKT[[:space:]]+%s\b|\b%s\b)" % (re.escape(name), re.escape(name))), q(nf)))
+        # a known-good netlist to diff against: the prefilled runset's SOURCE, else discovered
+        known = ""
+        if runset_src and os.path.isfile(runset_src):
+            known = (_parse_rule_file(runset_src) or {}).get("source_path") or ""
+        if not known:
+            try:
+                cand = discover_src_net(cell, cfg)
+                if cand and os.path.abspath(cand) != os.path.abspath(netlist or "x"):
+                    known = cand
+            except Exception:
+                pass
+        if known and netlist and os.path.abspath(known) != os.path.abspath(netlist):
+            L.append("# 3) diff the (incomplete) generated netlist vs a known-good one:")
+            L.append("diff -u %s %s" % (q(known), q(netlist)))
+            L.append("# 3b) subckts present in known-good but MISSING from ours (the culprits):")
+            L.append("comm -23 <(grep -oE '^\\.SUBCKT +[^ ]+' %s | awk '{print $2}' | sort -u) "
+                     "<(grep -oE '^\\.SUBCKT +[^ ]+' %s | awk '{print $2}' | sort -u)"
+                     % (q(known), q(netlist)))
+        L.append("# note: a missing .SUBCKT usually means a subcell has NO schematic/auCdl view,")
+        L.append("#       or is excluded by simStopList -- check the netlister log:")
+        L.append("sed -n '1,60p' %s" % q(os.path.join(run_dir, "netlist_%s.log" % cell)))
+
+    L.append("# 4) reproduce the exact Calibre run by hand (env must be module-loaded):")
     L.append("cd %s && %s" % (q(run_dir), repro))
-    L.append("# 4) the full log:")
+    L.append("# 5) the full log:")
     L.append("less %s" % q(job.log_path))
     L.append("=" * 72)
     L.append("")
@@ -1973,7 +2026,8 @@ def run_job(job):
         # On a Calibre failure (nonzero rc, or no result produced), emit a
         # copy/paste debug block with a ready diff vs the known-good runset.
         if rc != 0 or not os.path.isfile(result_file):
-            _debug_help(job, tool, run_dir, runfile, deck, job.meta.get("runset_src"))
+            _debug_help(job, tool, run_dir, runfile, deck, job.meta.get("runset_src"),
+                        src_net if tool == "lvs" else None)
 
         # --- 4. parse result ---
         phase("Parse results")
