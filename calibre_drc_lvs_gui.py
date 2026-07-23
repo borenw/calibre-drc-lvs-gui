@@ -196,7 +196,7 @@ CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
 STARTUP_LVS = ""       # existing _calibre.lvs_ runset passed on the command line (--lvs), prefilled on startup
-APP_REVISION = 46      # incremental build number, shown top-right in the GUI
+APP_REVISION = 47      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -2898,6 +2898,36 @@ async function showDebugTail(target,intro){ // dump the tail of the server debug
 }
 async function jpost(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
 function esc(s){return (s==null?'':(''+s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+// Colorize the live log: a PASSING LVS "CORRECT" banner -- the ASCII smiley
+// face, its box, the word CORRECT, and any check-mark glyphs -- turns green.
+// Everything else (the rest of the .lvs.report, an INCORRECT frowny, all other
+// tool output) keeps the default black/white. Returns escaped HTML for a <pre>.
+function colorizeJobLog(text){
+  const lines=(text||'').split('\n'), n=lines.length;
+  const isCorrect=s=>/\bCORRECT\b/.test(s)&&!/\bINCORRECT\b/.test(s);
+  const hasCheck=s=>/[✓✔√]/.test(s);          // check marks: check/heavy-check/root
+  // an ASCII-art line of the smiley/box: strokes only (no letters/digits), has a '#'
+  const isArt=s=>{const t=s.trim();return t.length>=1&&/#/.test(t)&&!/[A-Za-z0-9]/.test(t);};
+  const green=new Array(n).fill(false), correctIdx=[];
+  for(let i=0;i<n;i++){
+    if(isCorrect(lines[i])){green[i]=true;correctIdx.push(i);}
+    if(hasCheck(lines[i]))  green[i]=true;
+  }
+  // Only when the run actually passed: fold each ASCII-art block that sits next
+  // to a CORRECT line (same banner, within 3 lines) into the green highlight.
+  if(correctIdx.length){
+    let i=0;
+    while(i<n){
+      if(isArt(lines[i])){
+        let j=i; while(j+1<n&&isArt(lines[j+1])) j++;        // contiguous block [i..j]
+        if(correctIdx.some(c=>c>=i-3&&c<=j+3)){ for(let k=i;k<=j;k++) green[k]=true; }
+        i=j+1;
+      } else i++;
+    }
+  }
+  return lines.map((l,i)=> green[i]
+    ? '<span style="color:var(--good)">'+esc(l)+'</span>' : esc(l)).join('\n');
+}
 
 // ---- tabs ----
 $$('.tab').forEach(t=>t.onclick=()=>{
@@ -3441,7 +3471,7 @@ async function pollJob(jid){
     $('#reprowrap').style.display='block';
     $('#reprocopy').onclick=()=>copyText(d.reproduce,$('#reprocopy'));
   }else{ $('#reprowrap').style.display='none'; }
-  $('#joblog').textContent=d.log||'';
+  $('#joblog').innerHTML=colorizeJobLog(d.log||'');       // green LVS CORRECT smiley/check
   $('#joblog').scrollTop=$('#joblog').scrollHeight;       // tail the live log
   // show the Result in its own section once available; auto-scroll there once
   if(d.result || d.error){
