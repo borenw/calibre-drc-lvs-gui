@@ -179,7 +179,7 @@ CONFIG = {}
 CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
-APP_REVISION = 33      # incremental build number, shown top-right in the GUI
+APP_REVISION = 34      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -470,6 +470,31 @@ def extract_design_from_file(path):
         r"^\*(?:drc|lvs|cmnFDI)LayoutLibrary:\s*(\S+)",
         r"^\s*library\s+(\S+)",                        # strmout log
     ) or ""
+
+    # If this is an SVRF rule file (a Calibre-Interactive _calibre.lvs_ / _calibre.drc_
+    # meta deck, a *.lvs.rule runset, etc.), recover the SOURCE netlist, the INCLUDEd
+    # deck and the LAYOUT path so a paste-to-prefill reproduces the full rerun setup
+    # (matching the "Existing runsets" panel). These fields are absent from plain
+    # result logs, so they only appear when the input really is a rule file.
+    rf = _parse_rule_file(path)
+    if rf:
+        if not out["tool"]:
+            out["tool"] = rf["tool"]
+        if not out["cell"] and rf.get("cell"):
+            out["cell"] = rf["cell"]
+        if rf.get("source_path"):
+            out["source_path"] = rf["source_path"]
+        if rf.get("deck"):
+            out["deck"] = rf["deck"]
+            out["deck_exists"] = os.path.isfile(rf["deck"])
+        if rf.get("layout_path"):
+            # layout path in a rule file is usually relative to the rule file's dir
+            lp = rf["layout_path"]
+            if not os.path.isabs(lp):
+                lp = os.path.join(os.path.dirname(os.path.abspath(path)), lp)
+            out["layout_path"] = lp
+            out["layout_exists"] = os.path.isfile(lp)
+        out["notes"].append("SVRF rule file: recovered source/deck for rerun")
 
     # If lib unknown but we have a cell, look it up by scanning cds.lib libraries.
     if out["cell"] and not out["lib"]:
@@ -2275,8 +2300,8 @@ INDEX_HTML = r"""<!doctype html>
     <h2>Prefill from a previous log</h2>
     <div class="row">
       <div style="flex:3">
-        <label>Path to a .log / .drc.summary / .lvs.report / runset &mdash; fills tool, lib, cell, view</label>
-        <input type="text" id="prefillpath" placeholder="/path/to/cell.drc.summary  or  a runset  or  strmout.log">
+        <label>Path to a .log / .drc.summary / .lvs.report / runset (incl. Calibre <code>_calibre.lvs_</code>) &mdash; fills tool, lib, cell, view; a rule file also fills deck + source netlist (+ reuses the prior GDS)</label>
+        <input type="text" id="prefillpath" placeholder="/path/to/cell.lvs.report  or  a runset (_calibre.lvs_ / cell.lvs.rule)  or  strmout.log">
       </div>
       <div style="flex:0 0 auto;display:flex;align-items:flex-end;gap:8px">
         <button class="sec" id="prefillbtn">Prefill</button>
@@ -2580,8 +2605,20 @@ $('#prefillbtn').onclick=async()=>{
   if(d.cell)$('#cell').value=d.cell;
   if(d.cell)await loadViews();
   if(d.view)$('#view').value=d.view;
-  const got=['tool','lib','cell','view'].filter(k=>d[k]).map(k=>k+'='+d[k]).join('  ');
-  let msg='prefilled: '+(got||'(nothing found)');
+  // From an SVRF rule file (_calibre.lvs_ / *.lvs.rule): also carry the deck and
+  // the source netlist so a rerun reuses the exact same setup.
+  if(d.deck){ $('#deck').value = d.deck_exists===false ? '' : d.deck;
+              $('#deck').dataset.auto = d.deck_exists===false ? '1' : '0'; }
+  if(d.tool==='lvs' && d.source_path) $('#srcnet').value=d.source_path;
+  // rule files carry no view; reuse the exact prior GDS (if it still exists) so the
+  // rerun needs no view and reproduces the signed-off layout + netlist.
+  if(d.layout_path && d.layout_exists){ $('#existinggds').value=d.layout_path;
+    const det=$('#existinggds').closest('details'); if(det)det.open=true; }
+  const shown=['tool','lib','cell','view'].filter(k=>d[k]).map(k=>k+'='+d[k]);
+  if(d.deck) shown.push('deck='+d.deck.split('/').pop()+(d.deck_exists===false?'(missing→auto)':''));
+  if(d.source_path) shown.push('src='+d.source_path.split('/').pop());
+  if(d.layout_path&&d.layout_exists) shown.push('gds='+d.layout_path.split('/').pop());
+  let msg='prefilled: '+(shown.join('  ')||'(nothing found)');
   if(d.lib_candidates)msg+='  &mdash; cell in multiple libs: '+d.lib_candidates.join(', ');
   if(d.notes&&d.notes.length)msg+='  ['+d.notes.join('; ')+']';
   $('#prefillmsg').innerHTML=esc0(msg);

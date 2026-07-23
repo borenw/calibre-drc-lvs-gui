@@ -100,7 +100,10 @@ or with environment variables (`CDS_LIB`, `LAYERMAP`, `DRC_DECK`, `DRC_DECK_GLOB
   `INCLUDE` and `SOFTINCLUDE`.
 - **Prefill from a log** — paste a `.drc.summary` / `.lvs.report` / runset / strmout
   log and it fills tool + lib + cell + view (inferring the library from `cds.lib`
-  when the log doesn't name it).
+  when the log doesn't name it). Paste a **Calibre rule file** (`_calibre.lvs_`,
+  `*.lvs.rule`) and it additionally recovers the **INCLUDEd deck** and the **`SOURCE`
+  netlist**, and offers to **reuse the exact prior GDS** — a one-click, faithful
+  rerun of a previous Calibre-Interactive setup.
 - **Existing runsets reuse** — scans for existing Calibre rule files and lets you
   re-run a prior DRC/LVS setup (layout + cell + deck + source) in one click.
 - **Recently-edited layouts** — suggests the design you were just editing (newest
