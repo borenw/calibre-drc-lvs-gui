@@ -19,6 +19,19 @@
   "si_bin": "si",
   "virtuoso_bin": "virtuoso",
 
+  "_comment_qrc": "Parasitic extraction (the QRC tool). qrc_backend: calibre | assura | quantus. Command templates run one step per line; tune the flags/rules/ccl to your PDK. Calibre PEX reuses the layout + qrc_calibre_deck; Assura/Quantus read their own rules/.ccl (pass it as the runset).",
+  "qrc_backend": "calibre",
+  "qrc_out_fmt": "SPEF",
+  "qrc_calibre_bin": "calibre",
+  "qrc_calibre_deck": "/path/to/pdk/pex/calibre.xrc",
+  "qrc_calibre_cmd": "{calibre_bin} -xrc -phdb {runfile}\n{calibre_bin} -xrc -pdb -rc {runfile}\n{calibre_bin} -xrc -fmt -all {runfile}",
+  "qrc_assura_bin": "assura",
+  "qrc_assura_rules": "/path/to/pdk/rcx/av_parameters",
+  "qrc_assura_cmd": "{qrc_bin} -rcx {runset}",
+  "qrc_quantus_bin": "qrc",
+  "qrc_quantus_ccl": "/path/to/qrc.ccl",
+  "qrc_quantus_cmd": "{qrc_bin} -cmd {ccl}",
+
   "modules": "calibre cadence/ic618",
   "auto_load_modules": "yes",
 

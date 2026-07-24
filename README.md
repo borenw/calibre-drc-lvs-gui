@@ -79,7 +79,8 @@ or with environment variables (`CDS_LIB`, `LAYERMAP`, `DRC_DECK`, `DRC_DECK_GLOB
 | `--log PATH` | — | prefill the Run tab from an existing result log on startup; pass twice to also preset the Compare tab (A/B) |
 | `--lvs PATH` (`--calibre-lvs`) | — | prefill an existing Calibre-Interactive `_calibre.lvs_` runset on startup — reuses its deck, source netlist, and GDS so you can hit **GO** right away |
 | `--drc PATH` (`--calibre-drc`) | — | prefill an existing Calibre-Interactive `_calibre.drc_` runset on startup — reuses its deck and GDS so you can hit **GO** right away |
-| `--startNow` (`--start-now`) | off | immediately rerun the attached `--drc` and/or `--lvs` runset **headless** — no GUI needed. Streams `%`/ETA to the console (alongside the existing 5-second heartbeat), prints the result, then asks `[Y/n]` whether to keep the GUI up |
+| `--qrc PATH` (`--extract`) | — | prefill an existing parasitic-**extraction** runset — Calibre xRC/PEX, Assura RCX `av_parameters`, or Quantus QRC `.ccl`. The backend is auto-detected from the file |
+| `--startNow` (`--start-now`) | off | immediately rerun the attached `--drc` / `--lvs` / `--qrc` runset **headless** — no GUI needed. Streams `%`/ETA to the console (alongside the existing 5-second heartbeat), prints the result, then asks `[Y/n]` whether to keep the GUI up. **The GUI mirrors the run live**: open the printed URL any time and the browser attaches to the in-flight job |
 
 For example, point the GUI straight at a passing runset:
 
@@ -98,7 +99,31 @@ python3 calibre_drc_lvs_gui.py --lvs /path/to/_calibre.lvs_ --startNow
 python3 calibre_drc_lvs_gui.py --drc /path/to/_calibre.drc_ --lvs /path/to/_calibre.lvs_ --startNow
 ```
 
-The console shows the same run info as a GUI run plus a live `%`/ETA line, then a one-line **RESULT** (DRC `CLEAN`/violations, LVS `CORRECT`/`INCORRECT`). When it finishes you're asked **`Keep the GUI running? [Y/n]`** — answer `n` (or non-interactive, e.g. under `cron`) to end the script, or `Y`/Enter to leave the server up so you can open the URL and act in the browser. Calibre/strmout inherit the launching shell's environment, so run this from a shell where your Calibre modules are loaded.
+The console shows the same run info as a GUI run plus a live `%`/ETA line, then a one-line **RESULT** (DRC `CLEAN`/violations, LVS `CORRECT`/`INCORRECT`, QRC `EXTRACTED` + net/R/C counts). When it finishes you're asked **`Keep the GUI running? [Y/n]`** — answer `n` (or non-interactive, e.g. under `cron`) to end the script, or `Y`/Enter to leave the server up so you can open the URL and act in the browser. Calibre/strmout inherit the launching shell's environment, so run this from a shell where your tools' modules are loaded.
+
+While a `--startNow` run is in flight you can **open the printed URL in a browser** — it attaches to the running job and mirrors the same live progress, log, and result.
+
+For an LVS run, the console (and the GUI result) also prints the `.lvs.report` **PASS/`CORRECT` smiley ASCII** (~10–20 lines) with the cell name, plus the exact grep that reproduces it — the GUI shows a **one-click copy** button for that grep:
+
+```bash
+grep -nE '#{2,}|CORRECT|INCORRECT' cell.lvs.report
+```
+
+### QRC — parasitic extraction (Calibre xRC/PEX, Assura RCX, Quantus QRC)
+
+The **QRC** tool runs parasitic extraction and reports the extracted netlist (SPEF/DSPF) with net + R/C tallies. Pick the backend in the Run tab (or it's auto-detected from a `--qrc` runset):
+
+- **Calibre xRC/PEX** — reuses the layout + `qrc_calibre_deck`; the GUI synthesizes a PEX runset and runs the 3-phase `-xrc -phdb / -pdb -rc / -fmt`.
+- **Assura RCX** — pass its `av_parameters` / rules file as the runset (or set `qrc_assura_rules`).
+- **Quantus QRC** — pass its `.ccl` control file as the runset (or set `qrc_quantus_ccl`).
+
+```bash
+python3 calibre_drc_lvs_gui.py --qrc /path/to/_calibre.xrc_ --startNow      # Calibre PEX
+python3 calibre_drc_lvs_gui.py --qrc /path/to/av_parameters --startNow      # Assura RCX
+python3 calibre_drc_lvs_gui.py --qrc /path/to/qrc.ccl --startNow            # Quantus QRC
+```
+
+> The per-backend command lines are **config-driven** (`qrc_<backend>_cmd` in the Config tab / `config.example.json`) with canonical defaults — tune the flags, rules, and `.ccl` to your PDK and site. The plumbing (runset detection, launch, output parse, result display, headless streaming) is tested; validate the actual tool invocations against your Calibre/Assura/Quantus install.
 
 ## Features
 

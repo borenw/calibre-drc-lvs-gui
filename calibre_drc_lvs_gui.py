@@ -180,6 +180,31 @@ DEFAULT_CONFIG = {
     "drc_extra_svrf": "",
     "lvs_extra_svrf": "LVS REPORT OPTION NONE\nLVS RECOGNIZE GATES ALL",
 
+    # ---- QRC / parasitic extraction (a third "tool": extraction after LVS) --- #
+    # `qrc_backend` picks the extractor. Command templates use {placeholders} and
+    # are filled per run, then shlex-split and executed WITHOUT a shell. A template
+    # may hold MULTIPLE lines -- each non-blank line is one step, run in order.
+    # These defaults are CANONICAL STARTING POINTS: tune the flags/rules/ccl to
+    # your PDK + site. {placeholders}: calibre_bin qrc_bin runfile runset rules ccl
+    #                                  run_dir cell gds svdb out_fmt
+    "qrc_backend": _env("QRC_BACKEND", "calibre"),      # calibre | assura | quantus
+    "qrc_out_fmt": _env("QRC_OUT_FMT", "SPEF"),          # SPEF | DSPF
+    # -- Calibre xRC / PEX (xACT): 3 canonical phases (geometry -> R,C -> format).
+    "qrc_calibre_bin": _env("QRC_CALIBRE_BIN", _env("CALIBRE_BIN", "calibre")),
+    "qrc_calibre_deck": _env("QRC_CALIBRE_DECK", ""),    # PEX/xRC rules INCLUDEd by the runset
+    "qrc_calibre_extra_svrf": "",
+    "qrc_calibre_cmd": ("{calibre_bin} -xrc -phdb {runfile}\n"
+                        "{calibre_bin} -xrc -pdb -rc {runfile}\n"
+                        "{calibre_bin} -xrc -fmt -all {runfile}"),
+    # -- Assura RCX: driven by an av_parameters / RCX rules file (not synthesizable).
+    "qrc_assura_bin": _env("QRC_ASSURA_BIN", "assura"),
+    "qrc_assura_rules": _env("QRC_ASSURA_RULES", ""),    # RCX rules / av_parameters
+    "qrc_assura_cmd": "{qrc_bin} -rcx {runset}",
+    # -- Cadence Quantus QRC: driven by a .ccl control file (not synthesizable).
+    "qrc_quantus_bin": _env("QRC_QUANTUS_BIN", "qrc"),
+    "qrc_quantus_ccl": _env("QRC_QUANTUS_CCL", ""),      # Quantus control (.ccl) file
+    "qrc_quantus_cmd": "{qrc_bin} -cmd {ccl}",
+
     # Known-good LVS runset used as a TEMPLATE for EVERY LVS run: the tool copies
     # it and rewrites only the cell name + LAYOUT/SOURCE/REPORT paths, preserving
     # the deck INCLUDEs and all setup (crucially #!tvf / tvf::VERBATIM for TVF
@@ -197,7 +222,9 @@ RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
 STARTUP_LVS = ""       # existing _calibre.lvs_ runset passed on the command line (--lvs), prefilled on startup
 STARTUP_DRC = ""       # existing _calibre.drc_ runset passed on the command line (--drc), prefilled on startup
-APP_REVISION = 48      # incremental build number, shown top-right in the GUI
+STARTUP_QRC = ""       # existing extraction runset passed on the command line (--qrc), prefilled on startup
+CLI_JOB_ID = None      # id of the job a headless --startNow run launched, so the GUI can attach live
+APP_REVISION = 49      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -390,6 +417,53 @@ def parse_drc_summary(text):
     }
 
 
+def _is_lvs_art_line(s):
+    """A line of the LVS smiley/frowny ASCII banner: strokes only, has a '#'."""
+    t = s.strip()
+    return bool(t) and "#" in t and not re.search(r"[A-Za-z0-9]", t)
+
+
+def extract_lvs_banner(text, max_lines=24):
+    """Pull the ~10-20 line ASCII smiley/frowny block around the CORRECT/INCORRECT
+    result out of a .lvs.report. Returns the block as a list of lines (empty if no
+    banner found). Expands over the contiguous art/blank lines that surround the
+    result line so the whole face + box is captured."""
+    lines = text.splitlines()
+    idx = None
+    for i, l in enumerate(lines):
+        if re.search(r"#\s+CORRECT\s+#", l) or re.search(r"#\s+INCORRECT\s+#", l):
+            idx = i
+            break
+    if idx is None:
+        for i, l in enumerate(lines):
+            if re.match(r"\s*(CORRECT|INCORRECT)\b", l):
+                idx = i
+                break
+    if idx is None:
+        return []
+    a = b = idx
+    # walk up/down over art lines (and single interior blanks) that form the banner
+    while a - 1 >= 0 and idx - (a - 1) <= max_lines and \
+            (_is_lvs_art_line(lines[a - 1]) or
+             (not lines[a - 1].strip() and a - 2 >= 0 and _is_lvs_art_line(lines[a - 2]))):
+        a -= 1
+    while b + 1 < len(lines) and (b + 1) - idx <= max_lines and \
+            (_is_lvs_art_line(lines[b + 1]) or
+             (not lines[b + 1].strip() and b + 2 < len(lines) and _is_lvs_art_line(lines[b + 2]))):
+        b += 1
+    block = lines[a:b + 1]
+    while block and not block[0].strip():
+        block.pop(0)
+    while block and not block[-1].strip():
+        block.pop()
+    return block
+
+
+def lvs_smiley_grep(report_path):
+    """The exact grep that surfaces the smiley/frowny ASCII + the PASS/FAIL word."""
+    return "grep -nE '#{2,}|CORRECT|INCORRECT' %s" % shlex.quote(report_path or "cell.lvs.report")
+
+
 def parse_lvs_report(text):
     """Parse a .lvs.report -> overall CORRECT/INCORRECT + unmatched counts."""
     status = "UNKNOWN"
@@ -438,7 +512,32 @@ def parse_lvs_report(text):
         "status": status,
         "unmatched": unmatched,
         "total_unmatched": total_unmatched,
+        "banner": extract_lvs_banner(text),   # ~10-20 line smiley/frowny ASCII block
     }
+
+
+def _qrc_backend_of(path):
+    """Detect a parasitic-extraction runset and return its backend, else None:
+    calibre = Calibre xRC/PEX SVRF (PEX statements, or .xrc/.pex name);
+    assura  = Assura RCX (av_parameters / avParameters);
+    quantus = Cadence Quantus QRC (.ccl control file)."""
+    low = os.path.basename(path).lower()
+    try:
+        with open(path, "r", errors="replace") as f:
+            txt = f.read(200000)
+    except Exception:
+        return None
+    lt = txt.lower()
+    if low.endswith(".ccl") or ("qrc" in lt and "extract" in lt) \
+            or re.search(r"(?mi)^\s*(extraction_setup|input_db|cap_table|qrc_tech_file)\b", txt):
+        return "quantus"
+    if "avparameters" in lt or "av_parameters" in lt \
+            or re.search(r"(?m)\bavParameters\b", txt):
+        return "assura"
+    if re.search(r"(?mi)^\s*PEX\s+(NETLIST|REPORT|REDUCE|EXTRACT|MAP)\b", txt) \
+            or ".xrc" in low or ".pex" in low or "calibre.xrc" in low:
+        return "calibre"
+    return None
 
 
 def extract_design_from_file(path):
@@ -515,6 +614,18 @@ def extract_design_from_file(path):
         out["rulefile"] = os.path.abspath(path)   # the known-good runset itself
         out["notes"].append("SVRF rule file: recovered source/deck for rerun")
 
+    # Parasitic-extraction runset? (Calibre xRC/PEX, Assura RCX, Quantus QRC) --
+    # overrides the drc/lvs guess and carries the backend so the GUI prefills QRC.
+    be = _qrc_backend_of(path)
+    if be:
+        out["tool"] = "qrc"
+        out["backend"] = be
+        out["rulefile"] = os.path.abspath(path)
+        if not out["cell"]:
+            # calibre PEX SVRF has LAYOUT PRIMARY; assura/quantus may not -> use name
+            out["cell"] = out["cell"] or os.path.splitext(os.path.basename(path))[0]
+        out["notes"].append("parasitic-extraction runset (%s backend)" % be)
+
     # If lib unknown but we have a cell, look it up by scanning cds.lib libraries.
     if out["cell"] and not out["lib"]:
         matches = []
@@ -537,20 +648,76 @@ def extract_design_from_file(path):
     return out
 
 
+def parse_qrc_result(path, backend=None):
+    """Parse a parasitic-extraction netlist (SPEF / DSPF / SPF) -> net + R/C
+    tallies. Backend-agnostic: Calibre xRC, Assura RCX, and Quantus QRC all emit
+    standard SPEF/DSPF, so the same reader works for every backend."""
+    out = {"type": "qrc", "backend": backend, "status": "NO OUTPUT",
+           "out_netlist": None, "out_fmt": None, "cell": None,
+           "nets": None, "resistors": None, "capacitors": None}
+    if not (path and os.path.isfile(path)):
+        return out
+    out["out_netlist"] = os.path.abspath(path)
+    try:
+        with open(path, "r", errors="replace") as f:
+            text = f.read(4000000)
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+    out["status"] = "EXTRACTED"
+    nets = len(re.findall(r"(?m)^\*D_NET\b", text))          # SPEF
+    fmt = "SPEF"
+    if not nets:
+        n2 = len(re.findall(r"(?m)^\*\|NET\b", text))         # DSPF
+        if n2:
+            nets, fmt = n2, "DSPF"
+
+    def _count_section(tag):                                  # SPEF *RES / *CAP entries
+        n, inseg = 0, False
+        for ln in text.splitlines():
+            s = ln.strip()
+            if s.startswith(tag):
+                inseg = True
+                continue
+            if s.startswith("*END") or (s.startswith("*") and inseg and not s.startswith(tag)):
+                inseg = False
+            if inseg and s and s[0].isdigit():
+                n += 1
+        return n
+
+    res = _count_section("*RES")
+    cap = _count_section("*CAP")
+    if fmt == "DSPF":                                         # DSPF elements: R.../C... cards
+        res = res or len(re.findall(r"(?m)^R\S", text))
+        cap = cap or len(re.findall(r"(?m)^C\S", text))
+    m = re.search(r'(?m)^\*DESIGN\s+"?([^"\n]+)"?', text)     # SPEF design name
+    if m:
+        out["cell"] = m.group(1).strip()
+    out.update(out_fmt=fmt, nets=nets or None,
+               resistors=res or None, capacitors=cap or None)
+    return out
+
+
 def detect_and_parse(path):
     """Read a result file and parse by type; returns dict (raw text included)."""
     if not os.path.isfile(path):
         return {"type": "error", "error": "no such file: %s" % path}
+    low = path.lower()
+    if low.endswith((".spef", ".dspf", ".spf")) or low.endswith(".pex.netlist"):
+        res = parse_qrc_result(path)              # parasitic netlists can be huge -- own reader
+        res["path"] = os.path.abspath(path)
+        return res
     try:
         with open(path, "r", errors="replace") as f:
             text = f.read()
     except Exception as e:
         return {"type": "error", "error": str(e)}
-    low = path.lower()
     if low.endswith(".drc.summary") or ("CALIBRE::DRC" in text and "RULECHECK" in text):
         res = parse_drc_summary(text)
     elif low.endswith(".lvs.report") or "L V S   R E P O R T" in text or "LVS REPORT" in text:
         res = parse_lvs_report(text)
+    elif "*D_NET" in text[:4000] or "*|NET" in text[:4000]:
+        res = parse_qrc_result(path)
     else:
         res = {"type": "raw"}
     res["path"] = os.path.abspath(path)
@@ -1346,6 +1513,120 @@ def _write_lvs_runset(run_dir, cell, gds, src_net, deck, extra):
     return runfile
 
 
+def _write_qrc_calibre_runset(run_dir, cell, gds, src_net, deck, out_fmt, extra):
+    """Canonical Calibre xRC/PEX runset (a STARTING point -- tune PEX options to
+    your PDK). Returns (runfile, expected_output_basename)."""
+    fmt = (out_fmt or "SPEF").upper()
+    ext = "spef" if fmt == "SPEF" else "dspf"
+    out_base = "%s.pex.%s" % (cell, ext)
+    runfile = os.path.join(run_dir, "%s.xrc.rule" % cell)
+    with open(runfile, "w") as f:
+        f.write('// Auto-generated Calibre xRC/PEX runset -- %s\n'
+                % time.strftime("%Y-%m-%d %H:%M:%S"))
+        f.write('LAYOUT PATH "%s"\n' % gds)
+        f.write('LAYOUT PRIMARY "%s"\n' % cell)
+        f.write('LAYOUT SYSTEM GDSII\n\n')
+        if src_net:
+            f.write('SOURCE PATH "%s"\n' % src_net)
+            f.write('SOURCE PRIMARY "%s"\n' % cell)
+            f.write('SOURCE SYSTEM SPICE\n\n')
+        f.write('MASK SVDB DIRECTORY "svdb" QUERY XRC\n')
+        f.write('PEX REPORT "%s.pex.report"\n' % cell)
+        f.write('PEX NETLIST "%s" %s 1 SPICE\n\n' % (out_base, fmt))
+        f.write('DRC ICSTATION YES\n\n')
+        if extra.strip():
+            f.write(extra.strip() + "\n\n")
+        if deck:
+            f.write('INCLUDE "%s"\n' % deck)
+    return runfile, out_base
+
+
+def _find_qrc_output(run_dir, cell, hint):
+    """Locate the extracted parasitic netlist a backend just produced."""
+    if hint:
+        p = os.path.join(run_dir, hint)
+        if os.path.isfile(p):
+            return p
+    pats = ["%s.pex.spef" % cell, "%s.pex.dspf" % cell, "%s.spef" % cell,
+            "%s.dspf" % cell, "%s.spf" % cell, "*.spef", "*.dspf", "*.spf",
+            "*.pex.netlist"]
+    newest, nmt = None, -1.0
+    for pat in pats:
+        for p in globmod.glob(os.path.join(run_dir, pat)):
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if m > nmt:
+                nmt, newest = m, p
+    return newest
+
+
+def _qrc_backend_bin(cfg, backend):
+    return {"calibre": cfg.get("qrc_calibre_bin") or cfg.get("calibre_bin") or "calibre",
+            "assura": cfg.get("qrc_assura_bin") or "assura",
+            "quantus": cfg.get("qrc_quantus_bin") or "qrc"}.get(backend, "")
+
+
+def _qrc_run(job, cfg, run_dir, cell, gds, src_net, backend, runset_src):
+    """Run parasitic extraction for the chosen backend. Commands come from the
+    config templates (canonical defaults -- tune per site). Each non-blank line
+    of a template is one step. Returns (rc, result_file, backend, out_fmt)."""
+    backend = (backend or cfg.get("qrc_backend") or "calibre").strip().lower()
+    out_fmt = (cfg.get("qrc_out_fmt") or "SPEF").upper()
+    out_hint, tmpl = None, ""
+    qbin = _qrc_backend_bin(cfg, backend)
+    mapping = {"calibre_bin": cfg.get("calibre_bin") or "calibre", "qrc_bin": qbin,
+               "run_dir": run_dir, "cell": cell, "gds": gds, "svdb": "svdb",
+               "out_fmt": out_fmt, "runfile": "", "runset": "", "rules": "", "ccl": ""}
+    if backend == "calibre":
+        deck = (job.meta.get("deck") or cfg.get("qrc_calibre_deck") or "").strip()
+        runfile, out_hint = _write_qrc_calibre_runset(
+            run_dir, cell, gds, src_net, deck, out_fmt, cfg.get("qrc_calibre_extra_svrf", ""))
+        _artifact("xrc runset", runfile)
+        if deck:
+            _artifact("xrc deck", deck)
+        mapping["calibre_bin"] = qbin
+        mapping["runfile"] = os.path.basename(runfile)
+        mapping["runset"] = os.path.basename(runfile)
+        mapping["rules"] = deck
+        tmpl = cfg.get("qrc_calibre_cmd", "")
+    elif backend == "assura":
+        rules = (runset_src or cfg.get("qrc_assura_rules") or "").strip()
+        if not rules or not os.path.isfile(rules):
+            raise RuntimeError(
+                "Assura RCX needs a rules / av_parameters file -- pass it as the --qrc "
+                "runset, or set qrc_assura_rules in Config.")
+        _artifact("assura rules", rules)
+        mapping["runset"] = mapping["rules"] = rules
+        mapping["runfile"] = os.path.basename(rules)
+        tmpl = cfg.get("qrc_assura_cmd", "")
+    elif backend == "quantus":
+        ccl = (runset_src or cfg.get("qrc_quantus_ccl") or "").strip()
+        if not ccl or not os.path.isfile(ccl):
+            raise RuntimeError(
+                "Quantus QRC needs a .ccl control file -- pass it as the --qrc runset, "
+                "or set qrc_quantus_ccl in Config.")
+        _artifact("quantus ccl", ccl)
+        mapping["ccl"] = mapping["runset"] = mapping["rules"] = ccl
+        mapping["runfile"] = os.path.basename(ccl)
+        tmpl = cfg.get("qrc_quantus_cmd", "")
+    else:
+        raise RuntimeError("unknown QRC backend %r (use calibre|assura|quantus)" % backend)
+
+    steps = [ln for ln in (tmpl or "").splitlines() if ln.strip()]
+    if not steps:
+        raise RuntimeError("no command configured for QRC backend %r "
+                           "(set qrc_%s_cmd in Config)" % (backend, backend))
+    rc = 0
+    for i, ln in enumerate(steps):
+        rc = _run_step(job, "QRC/%s phase %d/%d" % (backend, i + 1, len(steps)),
+                       _fill(ln, mapping), run_dir)
+        if rc != 0:
+            break
+    return rc, _find_qrc_output(run_dir, cell, out_hint), backend, out_fmt
+
+
 def _write_lvs_runset_verbatim(run_dir, cell, gds, src_net, src_runset):
     """Rerun a *known-good* runset (e.g. a Calibre-Interactive `_calibre.lvs_`)
     VERBATIM: copy it and rewrite ONLY the LAYOUT/SOURCE paths + the LVS REPORT
@@ -1943,6 +2224,11 @@ def run_job(job):
     view = job.meta["view"]
     job.state = "running"
     _step_no = [0]
+    # QRC extraction: which backend, and whether it drives its own inputs (Assura
+    # RCX / Quantus QRC read a rules/ccl file, so the GUI skips strmout + runset).
+    qrc_backend = ((job.meta.get("backend") or cfg.get("qrc_backend") or "calibre")
+                   .strip().lower()) if tool == "qrc" else None
+    qrc_external = (tool == "qrc" and qrc_backend in ("assura", "quantus"))
 
     def phase(desc):
         _step_no[0] += 1
@@ -1950,13 +2236,20 @@ def run_job(job):
 
     try:
         _banner("JOB START:", "%s   %s / %s / %s   (run dir: %s)" %
-                (tool.upper(), lib, cell, view, run_dir))
+                (tool.upper() + (("/" + qrc_backend) if tool == "qrc" else ""),
+                 lib, cell, view, run_dir))
         # baseline for the progress bar: newest comparable prior run's log size
         job.meta["baseline_bytes"] = _find_baseline_bytes(job.meta)
 
         # 0. make sure the EDA tools are on PATH (auto `module load` if needed).
-        phase("Check environment (calibre/strmout on PATH; module-load if needed)")
-        needed = ["calibre"] + ([] if job.meta.get("existing_gds") else ["strmout"])
+        phase("Check environment (EDA tools on PATH; module-load if needed)")
+        if tool == "qrc":
+            _binkey = {"calibre": "qrc_calibre", "assura": "qrc_assura",
+                       "quantus": "qrc_quantus"}.get(qrc_backend, "qrc_calibre")
+            needed = [_binkey] + ([] if (qrc_external or job.meta.get("existing_gds"))
+                                  else ["strmout"])
+        else:
+            needed = ["calibre"] + ([] if job.meta.get("existing_gds") else ["strmout"])
         _ensure_tools(job, cfg, needed)
         for t in needed:
             sys.stdout.write("   -> %-14s %s\n" % (t + ":", shutil.which(_bin_for(cfg, t)) or "NOT FOUND"))
@@ -1992,53 +2285,58 @@ def run_job(job):
                                              "of the current OA cellview)\n")
                             sys.stdout.flush()
                             break
-        phase("Layout: %s" % ("use existing GDS" if existing_gds
-                              else "stream out from OpenAccess (strmout)"))
-        if existing_gds:
-            src = os.path.abspath(os.path.expanduser(existing_gds))
-            _log(job, "Using existing GDS: %s\n" % src)
-            if not os.path.isfile(src):
-                raise RuntimeError("existing GDS not found: %s" % src)
-            gds_abs = src
-            gds = src
+        if qrc_external:
+            # Assura RCX / Quantus QRC read their own layout via the rules/ccl
+            # file -- no strmout, no GDS handoff from the GUI.
+            gds = gds_abs = ""
         else:
-            # resolve a real cds.lib (config -> launch dir/parents -> $HOME)
-            cds = resolve_cds_lib(cfg)
-            if not cds:
-                raise RuntimeError(
-                    "cds.lib not found. Set 'cds_lib' in Config, or launch the GUI "
-                    "from your project directory (the one containing cds.lib).")
-            _artifact("cds.lib", cds)
-            # resolve techLib / layerMap: config, else auto-detect from strmout logs
-            techlib = (cfg.get("techlib") or "").strip()
-            layermap = (cfg.get("layermap") or "").strip()
-            if not techlib or not layermap:
-                opt = discover_strmout_opts()
-                if not techlib and opt["techlib"]:
-                    techlib = opt["techlib"]
-                    sys.stdout.write("   techLib auto-detected from strmout log: %s\n" % techlib)
-                if not layermap and opt["layermap"]:
-                    layermap = opt["layermap"]
-                    sys.stdout.write("   layerMap auto-detected from strmout log: %s\n" % layermap)
-                sys.stdout.flush()
-            # give strmout a cds.lib in the run dir that INCLUDEs the real one
-            local_cds = os.path.join(run_dir, "cds.lib")
-            with open(local_cds, "w", encoding="utf-8") as f:
-                f.write('INCLUDE "%s"\n' % cds)
-            mapping = {
-                "strmout_bin": cfg["strmout_bin"], "lib": lib, "cell": cell,
-                "view": view, "gds": gds, "strmlog": "strmout_%s.log" % cell,
-                "techlib": techlib, "layermap": layermap,
-            }
-            # drop -techLib / -layerMap if still blank so the command isn't corrupted
-            cmd = _drop_valueless_flags(_fill(cfg["strmout_cmd"], mapping),
-                                        {"-techLib", "-layerMap", "-layermap"})
-            rc = _run_step(job, "strmout (OA->GDS)", cmd, run_dir)
-            if rc != 0:
-                raise RuntimeError("strmout failed (rc=%d) -- see log" % rc)
-            if not os.path.isfile(gds_abs):
-                raise RuntimeError("strmout reported ok but %s not found" % gds)
-        _artifact("GDS", gds_abs if os.path.isabs(gds_abs) else os.path.join(run_dir, gds_abs))
+            phase("Layout: %s" % ("use existing GDS" if existing_gds
+                                  else "stream out from OpenAccess (strmout)"))
+            if existing_gds:
+                src = os.path.abspath(os.path.expanduser(existing_gds))
+                _log(job, "Using existing GDS: %s\n" % src)
+                if not os.path.isfile(src):
+                    raise RuntimeError("existing GDS not found: %s" % src)
+                gds_abs = src
+                gds = src
+            else:
+                # resolve a real cds.lib (config -> launch dir/parents -> $HOME)
+                cds = resolve_cds_lib(cfg)
+                if not cds:
+                    raise RuntimeError(
+                        "cds.lib not found. Set 'cds_lib' in Config, or launch the GUI "
+                        "from your project directory (the one containing cds.lib).")
+                _artifact("cds.lib", cds)
+                # resolve techLib / layerMap: config, else auto-detect from strmout logs
+                techlib = (cfg.get("techlib") or "").strip()
+                layermap = (cfg.get("layermap") or "").strip()
+                if not techlib or not layermap:
+                    opt = discover_strmout_opts()
+                    if not techlib and opt["techlib"]:
+                        techlib = opt["techlib"]
+                        sys.stdout.write("   techLib auto-detected from strmout log: %s\n" % techlib)
+                    if not layermap and opt["layermap"]:
+                        layermap = opt["layermap"]
+                        sys.stdout.write("   layerMap auto-detected from strmout log: %s\n" % layermap)
+                    sys.stdout.flush()
+                # give strmout a cds.lib in the run dir that INCLUDEs the real one
+                local_cds = os.path.join(run_dir, "cds.lib")
+                with open(local_cds, "w", encoding="utf-8") as f:
+                    f.write('INCLUDE "%s"\n' % cds)
+                mapping = {
+                    "strmout_bin": cfg["strmout_bin"], "lib": lib, "cell": cell,
+                    "view": view, "gds": gds, "strmlog": "strmout_%s.log" % cell,
+                    "techlib": techlib, "layermap": layermap,
+                }
+                # drop -techLib / -layerMap if still blank so the command isn't corrupted
+                cmd = _drop_valueless_flags(_fill(cfg["strmout_cmd"], mapping),
+                                            {"-techLib", "-layerMap", "-layermap"})
+                rc = _run_step(job, "strmout (OA->GDS)", cmd, run_dir)
+                if rc != 0:
+                    raise RuntimeError("strmout failed (rc=%d) -- see log" % rc)
+                if not os.path.isfile(gds_abs):
+                    raise RuntimeError("strmout reported ok but %s not found" % gds)
+            _artifact("GDS", gds_abs if os.path.isabs(gds_abs) else os.path.join(run_dir, gds_abs))
 
         # --- 2. optional source-netlist generation for LVS ---
         src_net = None
@@ -2105,9 +2403,16 @@ def run_job(job):
             _artifact("source net", src_net_abs)
             src_net = src_net_abs
 
-        # --- 3. write runset + launch calibre ---
-        phase("Generate runset + run Calibre %s (the long step)" % tool.upper())
-        if tool == "drc":
+        # --- 3. write runset + launch the verification/extraction tool ---
+        runfile = deck = None
+        if tool == "qrc":
+            phase("Run parasitic extraction (%s backend) -- the long step" % qrc_backend)
+            rc, result_file, _be, _fmt = _qrc_run(job, cfg, run_dir, cell, gds,
+                                                  src_net, qrc_backend,
+                                                  job.meta.get("runset_src"))
+            job.meta["qrc_out_fmt"] = _fmt
+        elif tool == "drc":
+            phase("Generate runset + run Calibre DRC (the long step)")
             _ex, _gl, _cf = job.meta.get("deck"), latest_deck("drc"), cfg["drc_deck"]
             sys.stdout.write("   deck resolution: explicit=%r glob-latest=%r config.drc_deck=%r\n"
                              "                    glob pattern=%r\n" %
@@ -2130,6 +2435,7 @@ def run_job(job):
             rc = _run_step(job, "calibre DRC", cmd, run_dir)
             result_file = os.path.join(run_dir, "%s.drc.summary" % cell)
         else:
+            phase("Generate runset + run Calibre LVS (the long step)")
             # Reuse a known-good runset as a TEMPLATE (preserving #!tvf /
             # tvf::VERBATIM / SVDB spec / LVS REPORT OPTION / #DEFINE / INCLUDE),
             # rewriting only the cell name + LAYOUT/SOURCE/REPORT paths. The deck
@@ -2188,24 +2494,34 @@ def run_job(job):
                                         "runfile": os.path.basename(runfile)})
             rc = _run_step(job, "calibre LVS", cmd, run_dir)
             result_file = os.path.join(run_dir, "%s.lvs.report" % cell)
-        _artifact("result", result_file)
-        # On a Calibre failure (nonzero rc, or no result produced), emit a
-        # copy/paste debug block with a ready diff vs the known-good runset.
-        if rc != 0 or not os.path.isfile(result_file):
+        have_result = bool(result_file) and os.path.isfile(result_file)
+        if result_file:
+            _artifact("result", result_file)
+        # On a Calibre DRC/LVS failure, emit a copy/paste debug block with a ready
+        # diff vs the known-good runset (extraction has its own backend logs).
+        if tool != "qrc" and (rc != 0 or not have_result):
             _debug_help(job, tool, run_dir, runfile, deck, job.meta.get("runset_src"),
                         src_net if tool == "lvs" else None)
 
         # --- 4. parse result ---
         phase("Parse results")
-        if os.path.isfile(result_file):
+        if have_result and tool == "qrc":
+            job.result = parse_qrc_result(result_file, qrc_backend)
+        elif have_result:
             parsed = detect_and_parse(result_file)
             parsed.pop("text", None)  # keep snapshot small
             job.result = parsed
+        elif tool == "qrc":
+            job.result = {"type": "error",
+                          "error": "no extracted netlist produced (%s backend) -- see the "
+                                   "backend log above" % qrc_backend}
         else:
             job.result = {"type": "error",
-                          "error": "result file not produced: %s" % os.path.basename(result_file)}
-        if rc != 0 and not os.path.isfile(result_file):
-            raise RuntimeError("calibre exited rc=%d and produced no result" % rc)
+                          "error": "result file not produced: %s"
+                                   % os.path.basename(result_file or "?")}
+        if rc != 0 and not have_result:
+            raise RuntimeError("%s exited rc=%d and produced no result"
+                               % (("QRC/" + qrc_backend) if tool == "qrc" else "calibre", rc))
 
         # persist metadata for the run registry / compare tab
         meta_out = dict(job.meta)
@@ -2449,8 +2765,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/envcheck":
                 return self._send_json(env_status())
             if path == "/api/startup":
+                # active_job lets a browser opened during a headless --startNow run
+                # attach to it and show live progress, same as a GUI-launched run.
+                aj = CLI_JOB_ID if (CLI_JOB_ID and CLI_JOB_ID in JOBS) else None
+                aj_dir = JOBS[aj].meta.get("run_dir") if aj else None
                 return self._send_json({"logs": STARTUP_LOGS, "lvs": STARTUP_LVS,
-                                        "drc": STARTUP_DRC})
+                                        "drc": STARTUP_DRC, "qrc": STARTUP_QRC,
+                                        "active_job": aj, "active_run_dir": aj_dir})
             if path == "/api/debuglog":
                 dl = os.path.join(RUNS_BASE, "gui_debug.log")
                 txt = ""
@@ -2532,11 +2853,18 @@ class Handler(BaseHTTPRequestHandler):
         # a known-good runset (with a layout .db it points at) can stand in for
         # lib/view -- its original layout + source are reused instead of streaming.
         runset_src = body.get("runset_src", "").strip()
+        backend = (body.get("backend", "") or "").strip().lower() or None
         has_runset_layout = bool(runset_src and os.path.isfile(runset_src)
                                  and (_parse_rule_file(runset_src) or {}).get("layout_path"))
-        if tool not in ("drc", "lvs") or not cell:
-            return self._send_json({"error": "need tool(drc|lvs) and cell"}, 400)
-        if not existing_gds and not (lib and view) and not has_runset_layout:
+        if tool not in ("drc", "lvs", "qrc") or not cell:
+            return self._send_json({"error": "need tool(drc|lvs|qrc) and cell"}, 400)
+        if tool == "qrc" and backend not in (None, "calibre", "assura", "quantus"):
+            return self._send_json({"error": "qrc backend must be calibre|assura|quantus"}, 400)
+        # Assura/Quantus extraction drive their own inputs from the rules/ccl file,
+        # so they don't need lib/view/GDS. Calibre PEX and DRC/LVS do.
+        qrc_external = tool == "qrc" and (backend in ("assura", "quantus"))
+        if (not qrc_external and not existing_gds and not (lib and view)
+                and not has_runset_layout):
             return self._send_json(
                 {"error": "need lib and view (or an existing GDS, or a prefilled runset)"}, 400)
         with CONFIG_LOCK:
@@ -2544,6 +2872,7 @@ class Handler(BaseHTTPRequestHandler):
         meta = {
             "tool": tool, "lib": lib or "existingGDS", "cell": cell,
             "view": view or "layout",
+            "backend": backend,                                        # qrc: calibre|assura|quantus
             "deck": body.get("deck", "").strip() or None,
             "src_net": body.get("src_net", "").strip() or None,
             "src_view": body.get("src_view", "").strip() or None,
@@ -2757,6 +3086,17 @@ INDEX_HTML = r"""<!doctype html>
     <div class="radio" style="margin-bottom:8px">
       <label><input type="radio" name="tool" value="drc" checked> DRC</label>
       <label><input type="radio" name="tool" value="lvs"> LVS</label>
+      <label><input type="radio" name="tool" value="qrc"> QRC (extract)</label>
+    </div>
+    <div id="qrconly" class="hidden" style="margin-bottom:8px">
+      <label>Extraction backend</label>
+      <select id="backend" style="max-width:320px">
+        <option value="calibre">Calibre xRC / PEX</option>
+        <option value="assura">Assura RCX</option>
+        <option value="quantus">Cadence Quantus QRC</option>
+      </select>
+      <div class="muted" style="font-size:12px;margin-top:4px">Assura/Quantus read their own
+        av_parameters / .ccl (pass it as the runset); Calibre PEX reuses the layout + deck.</div>
     </div>
     <div class="row">
       <div><label>Library <span class="muted">(type to search)</span></label>
@@ -2943,11 +3283,11 @@ $$('.tab').forEach(t=>t.onclick=()=>{
 });
 
 // ---- tool radio ----
-$$('input[name=tool]').forEach(r=>r.onchange=()=>{
-  $('#lvsonly').classList.toggle('hidden', currentTool()!=='lvs');
-  loadDecks();
-});
+$$('input[name=tool]').forEach(r=>r.onchange=()=>{ syncToolUI(); loadDecks(); });
 function currentTool(){return $$('input[name=tool]').find(r=>r.checked).value;}
+function syncToolUI(t){t=t||currentTool();
+  $('#lvsonly').classList.toggle('hidden',t!=='lvs');
+  $('#qrconly').classList.toggle('hidden',t!=='qrc');}
 
 // ---- deck auto-discovery (newest revision first) ----
 function fmtDate(t){return new Date(t*1000).toLocaleDateString();}
@@ -3039,7 +3379,8 @@ async function doPrefill(){
   LAST_RULEFILE = d.rulefile || '';   // set when the pasted file was an SVRF rule file
   PREFILL_CELL = d.cell || '';
   if(d.tool){$$('input[name=tool]').forEach(r=>r.checked=(r.value===d.tool));
-    $('#lvsonly').classList.toggle('hidden',d.tool!=='lvs');}
+    syncToolUI(d.tool);}
+  if(d.backend)$('#backend').value=d.backend;   // qrc: calibre|assura|quantus
   if(d.lib)$('#lib').value=d.lib;
   if(d.lib)await loadCells();
   if(d.cell)$('#cell').value=d.cell;
@@ -3054,7 +3395,7 @@ async function doPrefill(){
   // rerun needs no view and reproduces the signed-off layout + netlist.
   if(d.layout_path && d.layout_exists){ $('#existinggds').value=d.layout_path;
     const det=$('#existinggds').closest('details'); if(det)det.open=true; }
-  const shown=['tool','lib','cell','view'].filter(k=>d[k]).map(k=>k+'='+d[k]);
+  const shown=['tool','backend','lib','cell','view'].filter(k=>d[k]).map(k=>k+'='+d[k]);
   if(d.deck) shown.push('deck='+d.deck.split('/').pop()+(d.deck_exists===false?'(missing→auto)':''));
   if(d.source_path) shown.push('src='+d.source_path.split('/').pop());
   if(d.layout_path&&d.layout_exists) shown.push('gds='+d.layout_path.split('/').pop());
@@ -3118,7 +3459,7 @@ async function loadRuleFiles(){
 }
 function useRuleFile(r){
   $$('input[name=tool]').forEach(x=>x.checked=(x.value===r.tool));
-  $('#lvsonly').classList.toggle('hidden',r.tool!=='lvs');
+  syncToolUI(r.tool);
   $('#cell').value=r.cell;
   if(r.layout_exists){ $('#existinggds').value=r.layout_path;
     const det=$('#existinggds').closest('details'); if(det)det.open=true; }
@@ -3161,7 +3502,7 @@ async function loadRecent(){
 }
 function useDesign(tool,r){
   $$('input[name=tool]').forEach(x=>x.checked=(x.value===tool));
-  $('#lvsonly').classList.toggle('hidden',tool!=='lvs');
+  syncToolUI(tool);
   $('#lib').value=r.lib; $('#cell').value=r.cell; $('#view').value=r.view;
   loadCells(); loadDecks();
   $('#runmsg').innerHTML='loaded <b>'+esc(r.lib+' / '+r.cell+' / '+r.view)+'</b> for '+tool.toUpperCase()+' &mdash; click Run';
@@ -3241,7 +3582,7 @@ async function easyRun(){
     if(!cell){ set('could not determine the cell from '+esc(drc.name)+'; pick manually below.'); return; }
     // reflect into the form so the user sees what will run
     $$('input[name=tool]').forEach(x=>x.checked=(x.value==='drc'));
-    $('#lvsonly').classList.add('hidden');
+    syncToolUI('drc');
     if(lib){ $('#lib').value=lib; await loadCells(); }
     $('#cell').value=cell; $('#view').value=view; loadDecks();
     // 4) launch — use OA strmout when we know the lib, else the sibling GDS next to the log
@@ -3389,23 +3730,30 @@ function startRunUI(){ RESULT_SCROLLED=false; FOLLOW_LOG=true;
 window.addEventListener('wheel',()=>{FOLLOW_LOG=false;},{passive:true});
 window.addEventListener('touchmove',()=>{FOLLOW_LOG=false;},{passive:true});
 async function runCurrentForm(){
-  const body={tool:currentTool(),lib:$('#lib').value,cell:$('#cell').value,view:$('#view').value,
+  const tool=currentTool();
+  const backend=$('#backend').value;
+  const qrcExternal=(tool==='qrc'&&(backend==='assura'||backend==='quantus'));
+  const body={tool:tool,backend:backend,lib:$('#lib').value,cell:$('#cell').value,view:$('#view').value,
     deck:$('#deck').value,src_net:$('#srcnet').value,src_view:$('#srcview').value,
     runset_src:LAST_RULEFILE,   // pass the prefilled runset so a failure prints a diff vs it
     existing_gds:$('#existinggds').value};
-  if(!body.cell){$('#runmsg').textContent='pick a cell (or use an existing GDS)';return false;}
-  if(!body.existing_gds && (!body.lib||!body.view)){$('#runmsg').textContent='pick lib/cell/view, or set an existing GDS';return false;}
+  if(!body.cell && !qrcExternal){$('#runmsg').textContent='pick a cell (or use an existing GDS)';return false;}
+  if(!qrcExternal && !body.existing_gds && (!body.lib||!body.view)){$('#runmsg').textContent='pick lib/cell/view, or set an existing GDS';return false;}
+  if(qrcExternal && !LAST_RULEFILE){$('#runmsg').textContent='Assura/Quantus need their rules/.ccl — prefill it above (or set it in Config)';return false;}
   $('#runbtn').disabled=true;$('#runmsg').textContent='launching...';
   const d=await jpost('/api/run',body);
   $('#runbtn').disabled=false;
   if(d.error){$('#runmsg').textContent='ERROR: '+d.error;return false;}
-  $('#runmsg').textContent='job '+d.job_id+'  ('+d.run_dir+')';
-  startRunUI();
+  attachJob(d.job_id,d.run_dir);
   $('#livepanel').scrollIntoView({behavior:'smooth',block:'start'});
-  if(pollTimer)clearInterval(pollTimer);
-  pollTimer=setInterval(()=>pollJob(d.job_id),1200);
-  pollJob(d.job_id);
   return true;
+}
+function attachJob(job_id,run_dir){   // start polling + showing a running job (GUI- or CLI-launched)
+  $('#runmsg').textContent='job '+job_id+(run_dir?('  ('+run_dir+')'):'');
+  startRunUI();
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(()=>pollJob(job_id),1200);
+  pollJob(job_id);
 }
 $('#runbtn').onclick=runCurrentForm;
 function fmtDur(s){s=Math.round(s||0);const m=Math.floor(s/60),ss=s%60;
@@ -3501,8 +3849,12 @@ function statusPill(r){
     return '<span class="pill '+(ok?'good':'bad')+'">'+esc(r.status)+'</span>';}
   if(r.type==='lvs'){const ok=r.status==='CORRECT';
     return '<span class="pill '+(ok?'good':(r.status==='INCORRECT'?'bad':'warn'))+'">'+esc(r.status)+'</span>';}
+  if(r.type==='qrc'){const ok=r.status==='EXTRACTED';
+    return '<span class="pill '+(ok?'good':'bad')+'">'+esc((r.backend?r.backend.toUpperCase()+' ':'')+r.status)+'</span>';}
   return '<span class="pill muted">'+esc(r.status||r.type)+'</span>';
 }
+// The exact grep that surfaces the .lvs.report smiley ASCII + PASS/FAIL word.
+function lvsGrep(path){return "grep -nE '#{2,}|CORRECT|INCORRECT' "+(path||'cell.lvs.report');}
 function renderResult(r){
   if(!r)return '';
   if(r.type==='error')return '<div class="pill bad">'+esc(r.error)+'</div>';
@@ -3530,6 +3882,24 @@ function renderResult(r){
       ks.forEach(k=>{const x=u[k];h+='<tr><td>'+esc(k)+'</td><td>'+x.layout_matched+'</td><td>'+x.source_matched+'</td><td>'+x.layout_unmatched+'</td><td>'+x.source_unmatched+'</td></tr>';});
       h+='</tbody></table>';
     }
+    // The .lvs.report PASS/FAIL smiley ASCII (~10-20 lines) -- greened when CORRECT
+    // -- plus the exact grep that reproduces it, with a 1-click copy button.
+    if(r.banner&&r.banner.length){
+      const lbl=r.status==='CORRECT'?'PASS / smiley ASCII':'result ASCII';
+      h+='<details open style="margin-top:10px"><summary>'+lbl+' &mdash; cell <b>'+esc(r.cell||'?')+'</b></summary>'+
+         '<pre style="margin:6px 0">'+colorizeJobLog(r.banner.join('\n'))+'</pre></details>';
+      const g=lvsGrep(r.path);
+      h+='<div style="display:flex;gap:8px;align-items:center;margin-top:4px">'+
+         '<code style="flex:1;font-size:12px;word-break:break-all">'+esc(g)+'</code>'+
+         '<button class="sec" style="padding:3px 10px" onclick="copyText('+JSON.stringify(g).replace(/"/g,'&quot;')+',this)">&#128203; copy grep</button></div>';
+    }
+  }else if(r.type==='qrc'){
+    h+='<div class="kv"><div>Backend</div><div>'+esc((r.backend||'?').toUpperCase())+'</div>'+
+       '<div>Format</div><div>'+esc(r.out_fmt||'?')+'</div>'+
+       '<div>Nets</div><div>'+(r.nets!=null?r.nets:'?')+'</div>'+
+       '<div>Resistors</div><div>'+(r.resistors!=null?r.resistors:'?')+'</div>'+
+       '<div>Capacitors</div><div>'+(r.capacitors!=null?r.capacitors:'?')+'</div></div>';
+    if(r.out_netlist)h+='<div style="margin-top:6px">extracted netlist: <code style="font-size:12px">'+esc(r.out_netlist)+'</code></div>';
   }
   if(r.path)h+='<div class="muted" style="margin-top:6px">'+esc(r.path)+'</div>';
   return h;
@@ -3715,7 +4085,18 @@ const CFG_LABELS={
   sim_user:'sim user for log search (blank = login name)',
   sim_roots:'log-search roots ({user} expands)',
   drc_extra_svrf:'extra DRC SVRF lines',lvs_extra_svrf:'extra LVS SVRF lines',
-  lvs_runset_template:'known-good LVS runset reused as a template for every cell (e.g. a TVF _calibre.lvs_)'};
+  lvs_runset_template:'known-good LVS runset reused as a template for every cell (e.g. a TVF _calibre.lvs_)',
+  qrc_backend:'QRC extraction backend (calibre | assura | quantus)',
+  qrc_out_fmt:'extracted netlist format (SPEF | DSPF)',
+  qrc_calibre_bin:'Calibre xRC/PEX executable',
+  qrc_calibre_deck:'Calibre PEX/xRC rules deck (INCLUDEd by the xRC runset)',
+  qrc_calibre_cmd:'Calibre xRC command template (one step per line)',
+  qrc_assura_bin:'Assura executable (RCX)',
+  qrc_assura_rules:'Assura RCX rules / av_parameters file',
+  qrc_assura_cmd:'Assura RCX command template',
+  qrc_quantus_bin:'Quantus QRC executable',
+  qrc_quantus_ccl:'Quantus QRC control (.ccl) file',
+  qrc_quantus_cmd:'Quantus QRC command template'};
 async function loadConfig(){
   const c=await jget('/api/config');const box=$('#cfgfields');box.innerHTML='';
   Object.keys(CFG_LABELS).forEach(k=>{
@@ -3743,18 +4124,25 @@ loadDecks();
 loadRuleFiles();
 loadRecent();
 initStartup();
-async function initStartup(){          // --lvs / --drc / --log paths passed on the command line
+async function initStartup(){          // --lvs / --drc / --qrc / --log + live headless run
   let d;try{ d=await jget('/api/startup'); }catch(e){ d=null; }
   const lvs=(d&&d.lvs)||'';
   const drc=(d&&d.drc)||'';
-  const runset=lvs||drc;               // --lvs wins if both were passed
+  const qrc=(d&&d.qrc)||'';
+  const runset=lvs||drc||qrc;          // --lvs, else --drc, else --qrc
   const logs=(d&&d.logs)||[];
-  if(runset){                          // --lvs / --drc: prefill the given _calibre.<tool>_ runset
+  // A headless --startNow run is in flight -> attach the live panel to it so the
+  // browser mirrors the command-line progress (same job snapshot, 1.2s poll).
+  if(d&&d.active_job){
+    attachJob(d.active_job,d.active_run_dir||'');
+    $('#prefillmsg').innerHTML+=' &bull; attached to the running --startNow job ('+esc(d.active_job)+')';
+  }
+  if(runset){                          // --lvs / --drc / --qrc: prefill the given runset
     $('#prefillpath').value=runset;
     $('#prefillbtn').click();          // reuses its deck + source netlist + GDS -> ready to GO
-    $('#prefillmsg').innerHTML+= lvs
-      ? ' &bull; _calibre.lvs_ from command line (--lvs)'
-      : ' &bull; _calibre.drc_ from command line (--drc)';
+    $('#prefillmsg').innerHTML+= lvs ? ' &bull; _calibre.lvs_ from command line (--lvs)'
+                                : drc ? ' &bull; _calibre.drc_ from command line (--drc)'
+                                :       ' &bull; extraction runset from command line (--qrc)';
     if(logs.length>=2){                // any two --log paths still preset Compare
       $('#cmpPathA').value=logs[0]; $('#cmpPathB').value=logs[1];
       $('#prefillmsg').innerHTML+=' &bull; 2 logs on command line &mdash; Compare tab preset';
@@ -3815,27 +4203,32 @@ def _fmt_dur(s):
 
 
 def _runset_to_meta(tool, path):
-    """Build a run `meta` from an existing _calibre.<tool>_ runset, mirroring the
-    GUI's prefill->GO mapping, so a headless --startNow reruns it verbatim.
-    Returns (meta, None) or (None, reason)."""
+    """Build a run `meta` from an existing runset (_calibre.<tool>_ / xRC / Assura
+    / Quantus), mirroring the GUI's prefill->GO mapping, so a headless --startNow
+    reruns it. Returns (meta, None) or (None, reason)."""
     d = extract_design_from_file(path)
     t = tool or d.get("tool") or ""
-    if t not in ("drc", "lvs"):
-        return None, "could not tell drc/lvs from %s" % path
+    if t not in ("drc", "lvs", "qrc"):
+        return None, "could not tell drc/lvs/qrc from %s" % path
+    backend = d.get("backend") if t == "qrc" else None
+    qrc_external = t == "qrc" and backend in ("assura", "quantus")
     cell = d.get("cell") or ""
-    if not cell:
+    if not cell and not qrc_external:
         return None, "no cell name found in %s" % path
+    if not cell:
+        cell = os.path.splitext(os.path.basename(path))[0]
     layout = d.get("layout_path") if d.get("layout_exists") else ""
     deck = d.get("deck") if d.get("deck_exists") else None
-    src = d.get("source_path") if t == "lvs" else None
-    if not layout and not (d.get("lib") and d.get("view")):
+    src = d.get("source_path") if t in ("lvs", "qrc") else None
+    # Assura/Quantus drive their own inputs from the rules/ccl, so no GDS/lib needed.
+    if not qrc_external and not layout and not (d.get("lib") and d.get("view")):
         return None, ("runset has no reusable GDS and no lib/view -- open the GUI to "
                       "set lib/view for cell %r" % cell)
     with CONFIG_LOCK:
         cfg_snap = dict(CONFIG)
     meta = {
         "tool": t, "lib": d.get("lib") or "existingGDS", "cell": cell,
-        "view": d.get("view") or "layout",
+        "view": d.get("view") or "layout", "backend": backend,
         "deck": deck, "src_net": src, "src_view": None,
         "runset_src": d.get("rulefile") or os.path.abspath(path),
         "existing_gds": layout or None,
@@ -3864,6 +4257,24 @@ def _cli_print_result(snap):
         if r.get("total_unmatched") is not None:
             print("               total unmatched (inst+nets+ports): %s"
                   % r.get("total_unmatched"))
+        # Show the .lvs.report PASS/FAIL smiley ASCII (the ~10-20 line banner) and
+        # the exact grep that reproduces it -- in the console, matching the HTML.
+        banner = r.get("banner") or []
+        if banner:
+            print("   %s ASCII (from %s):"
+                  % ("PASS/smiley" if r.get("status") == "CORRECT" else "result",
+                     os.path.basename(r.get("path") or "cell.lvs.report")))
+            for ln in banner:
+                print("     " + ln)
+        if r.get("path"):
+            print("   grep      : %s" % lvs_smiley_grep(r.get("path")))
+    elif r.get("type") == "qrc":
+        print("   RESULT    : QRC %s  backend=%s  cell=%s  (%s)"
+              % (r.get("status"), r.get("backend") or "?", r.get("cell") or "?", el))
+        print("               format %s  nets %s  resistors %s  capacitors %s"
+              % (r.get("out_fmt"), r.get("nets"), r.get("resistors"), r.get("capacitors")))
+        if r.get("out_netlist"):
+            print("   netlist   : %s" % r.get("out_netlist"))
     else:
         print("   RESULT    : %s (%s)" % (st, el))
     rd = (snap.get("meta") or {}).get("run_dir")
@@ -3882,7 +4293,10 @@ def _cli_run_one(tool, path):
         print("   --startNow %s: cannot run -- %s" % (tool.upper(), err))
         sys.stdout.flush()
         return None
-    print("   --startNow: running %s on cell %s" % (tool.upper(), meta["cell"]))
+    print("   --startNow: running %s%s on cell %s"
+          % (tool.upper(),
+             ("/" + meta["backend"]) if (tool == "qrc" and meta.get("backend")) else "",
+             meta["cell"]))
     print("     runset  : %s" % path)
     if meta.get("existing_gds"):
         print("     GDS     : %s" % meta["existing_gds"])
@@ -3892,6 +4306,11 @@ def _cli_run_one(tool, path):
         print("     source  : %s" % meta["src_net"])
     sys.stdout.flush()
     job = start_job(meta)
+    global CLI_JOB_ID
+    CLI_JOB_ID = job.id          # so a browser opened during the run attaches live
+    print("     job     : %s  (open the GUI URL to watch this run live in a browser)"
+          % job.id)
+    sys.stdout.flush()
     try:
         while True:
             snap = job.snapshot()
@@ -3962,17 +4381,22 @@ def main():
                     help="path to an existing Calibre-Interactive _calibre.drc_ runset; "
                          "prefill it on startup (reuses its deck and GDS) so you can hit "
                          "GO right away")
+    ap.add_argument("--qrc", "--extract", dest="qrc", metavar="PATH", default=None,
+                    help="path to an existing parasitic-EXTRACTION runset (Calibre xRC/PEX, "
+                         "Assura RCX av_parameters, or Quantus QRC .ccl); prefill it on "
+                         "startup. The backend is auto-detected from the file")
     ap.add_argument("--startNow", "--start-now", dest="startNow", action="store_true",
-                    help="immediately rerun the attached --drc and/or --lvs runset "
+                    help="immediately rerun the attached --drc / --lvs / --qrc runset "
                          "headless (no GUI needed), streaming %%/ETA to the console; "
                          "at the end you're asked [Y/n] whether to keep the GUI up")
     args = ap.parse_args()
 
-    global STARTUP_LOGS, STARTUP_LVS, STARTUP_DRC
+    global STARTUP_LOGS, STARTUP_LVS, STARTUP_DRC, STARTUP_QRC
     STARTUP_LOGS = [os.path.abspath(os.path.expanduser(p)) for p in (args.log or [])]
     STARTUP_LVS = os.path.abspath(os.path.expanduser(args.lvs)) if args.lvs else ""
     STARTUP_DRC = os.path.abspath(os.path.expanduser(args.drc)) if args.drc else ""
-    for flag, p in (("--lvs", STARTUP_LVS), ("--drc", STARTUP_DRC)):
+    STARTUP_QRC = os.path.abspath(os.path.expanduser(args.qrc)) if args.qrc else ""
+    for flag, p in (("--lvs", STARTUP_LVS), ("--drc", STARTUP_DRC), ("--qrc", STARTUP_QRC)):
         if p and not os.path.isfile(p):
             sys.stderr.write("WARNING: %s path does not exist: %s\n" % (flag, p))
 
@@ -4021,6 +4445,8 @@ def main():
         print("   --lvs     : %s" % STARTUP_LVS)
     if STARTUP_DRC:
         print("   --drc     : %s" % STARTUP_DRC)
+    if STARTUP_QRC:
+        print("   --qrc     : %s" % STARTUP_QRC)
     if STARTUP_LOGS:
         print("   --log     : %s" % ", ".join(STARTUP_LOGS))
     if args.startNow:
@@ -4059,16 +4485,17 @@ def main():
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
 
-    if args.startNow and not (STARTUP_DRC or STARTUP_LVS):
-        print("   --startNow: no --drc/--lvs runset given; just serving the GUI.")
+    if args.startNow and not (STARTUP_DRC or STARTUP_LVS or STARTUP_QRC):
+        print("   --startNow: no --drc/--lvs/--qrc runset given; just serving the GUI.")
         sys.stdout.flush()
 
-    if args.startNow and (STARTUP_DRC or STARTUP_LVS):
+    if args.startNow and (STARTUP_DRC or STARTUP_LVS or STARTUP_QRC):
         # Headless: rerun the attached runset(s) now, streaming progress to the
-        # console -- no browser needed. DRC first, then LVS if both were given.
+        # console -- no browser needed. DRC, then LVS, then QRC extraction.
         try:
             for tool, rs in ((("drc", STARTUP_DRC),) if STARTUP_DRC else ()) + \
-                            ((("lvs", STARTUP_LVS),) if STARTUP_LVS else ()):
+                            ((("lvs", STARTUP_LVS),) if STARTUP_LVS else ()) + \
+                            ((("qrc", STARTUP_QRC),) if STARTUP_QRC else ()):
                 _cli_run_one(tool, rs)
             keep = _cli_prompt_keep_gui(url)
         except KeyboardInterrupt:
