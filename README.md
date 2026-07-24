@@ -78,12 +78,27 @@ or with environment variables (`CDS_LIB`, `LAYERMAP`, `DRC_DECK`, `DRC_DECK_GLOB
 | `--open` | off | try to open a browser |
 | `--log PATH` | — | prefill the Run tab from an existing result log on startup; pass twice to also preset the Compare tab (A/B) |
 | `--lvs PATH` (`--calibre-lvs`) | — | prefill an existing Calibre-Interactive `_calibre.lvs_` runset on startup — reuses its deck, source netlist, and GDS so you can hit **GO** right away |
+| `--drc PATH` (`--calibre-drc`) | — | prefill an existing Calibre-Interactive `_calibre.drc_` runset on startup — reuses its deck and GDS so you can hit **GO** right away |
+| `--startNow` (`--start-now`) | off | immediately rerun the attached `--drc` and/or `--lvs` runset **headless** — no GUI needed. Streams `%`/ETA to the console (alongside the existing 5-second heartbeat), prints the result, then asks `[Y/n]` whether to keep the GUI up |
 
 For example, point the GUI straight at a passing runset:
 
 ```bash
 python3 calibre_drc_lvs_gui.py --open --lvs /path/to/_calibre.lvs_
+python3 calibre_drc_lvs_gui.py --open --drc /path/to/_calibre.drc_
 ```
+
+### Headless — rerun from the command line, no GUI needed
+
+Add `--startNow` to rerun the attached runset(s) immediately and watch progress in the terminal. DRC runs first, then LVS if both are given:
+
+```bash
+python3 calibre_drc_lvs_gui.py --drc /path/to/_calibre.drc_ --startNow
+python3 calibre_drc_lvs_gui.py --lvs /path/to/_calibre.lvs_ --startNow
+python3 calibre_drc_lvs_gui.py --drc /path/to/_calibre.drc_ --lvs /path/to/_calibre.lvs_ --startNow
+```
+
+The console shows the same run info as a GUI run plus a live `%`/ETA line, then a one-line **RESULT** (DRC `CLEAN`/violations, LVS `CORRECT`/`INCORRECT`). When it finishes you're asked **`Keep the GUI running? [Y/n]`** — answer `n` (or non-interactive, e.g. under `cron`) to end the script, or `Y`/Enter to leave the server up so you can open the URL and act in the browser. Calibre/strmout inherit the launching shell's environment, so run this from a shell where your Calibre modules are loaded.
 
 ## Features
 

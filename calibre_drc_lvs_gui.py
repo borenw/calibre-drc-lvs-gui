@@ -196,7 +196,8 @@ CONFIG_PATH = None
 RUNS_BASE = None
 STARTUP_LOGS = []      # result logs passed on the command line (--log), for prefill/compare
 STARTUP_LVS = ""       # existing _calibre.lvs_ runset passed on the command line (--lvs), prefilled on startup
-APP_REVISION = 47      # incremental build number, shown top-right in the GUI
+STARTUP_DRC = ""       # existing _calibre.drc_ runset passed on the command line (--drc), prefilled on startup
+APP_REVISION = 48      # incremental build number, shown top-right in the GUI
 
 
 # Superseded module_load_cmd values -> auto-upgraded to the current default.
@@ -624,8 +625,9 @@ class Job(object):
                 "finished": self.finished,
                 "reproduce": build_reproduce(self.meta, steps),
             }
-        # read log tail
+        # read log tail (size stays 0 until run.log exists -- e.g. the first poll)
         log = ""
+        size = 0
         try:
             if os.path.isfile(self.log_path):
                 with open(self.log_path, "r", encoding="utf-8", errors="replace") as f:
@@ -2447,7 +2449,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/envcheck":
                 return self._send_json(env_status())
             if path == "/api/startup":
-                return self._send_json({"logs": STARTUP_LOGS, "lvs": STARTUP_LVS})
+                return self._send_json({"logs": STARTUP_LOGS, "lvs": STARTUP_LVS,
+                                        "drc": STARTUP_DRC})
             if path == "/api/debuglog":
                 dl = os.path.join(RUNS_BASE, "gui_debug.log")
                 txt = ""
@@ -3740,14 +3743,18 @@ loadDecks();
 loadRuleFiles();
 loadRecent();
 initStartup();
-async function initStartup(){          // --lvs / --log paths passed on the command line
+async function initStartup(){          // --lvs / --drc / --log paths passed on the command line
   let d;try{ d=await jget('/api/startup'); }catch(e){ d=null; }
   const lvs=(d&&d.lvs)||'';
+  const drc=(d&&d.drc)||'';
+  const runset=lvs||drc;               // --lvs wins if both were passed
   const logs=(d&&d.logs)||[];
-  if(lvs){                             // --lvs: prefill the given _calibre.lvs_ runset
-    $('#prefillpath').value=lvs;
+  if(runset){                          // --lvs / --drc: prefill the given _calibre.<tool>_ runset
+    $('#prefillpath').value=runset;
     $('#prefillbtn').click();          // reuses its deck + source netlist + GDS -> ready to GO
-    $('#prefillmsg').innerHTML+=' &bull; _calibre.lvs_ from command line (--lvs)';
+    $('#prefillmsg').innerHTML+= lvs
+      ? ' &bull; _calibre.lvs_ from command line (--lvs)'
+      : ' &bull; _calibre.drc_ from command line (--drc)';
     if(logs.length>=2){                // any two --log paths still preset Compare
       $('#cmpPathA').value=logs[0]; $('#cmpPathB').value=logs[1];
       $('#prefillmsg').innerHTML+=' &bull; 2 logs on command line &mdash; Compare tab preset';
@@ -3800,6 +3807,140 @@ def _force_utf8_console():
                 pass
 
 
+def _fmt_dur(s):
+    """Seconds -> "1m05s" / "9s" (mirrors the GUI's fmtDur)."""
+    s = int(round(s or 0))
+    m, ss = divmod(s, 60)
+    return ("%dm%02ds" % (m, ss)) if m else ("%ds" % ss)
+
+
+def _runset_to_meta(tool, path):
+    """Build a run `meta` from an existing _calibre.<tool>_ runset, mirroring the
+    GUI's prefill->GO mapping, so a headless --startNow reruns it verbatim.
+    Returns (meta, None) or (None, reason)."""
+    d = extract_design_from_file(path)
+    t = tool or d.get("tool") or ""
+    if t not in ("drc", "lvs"):
+        return None, "could not tell drc/lvs from %s" % path
+    cell = d.get("cell") or ""
+    if not cell:
+        return None, "no cell name found in %s" % path
+    layout = d.get("layout_path") if d.get("layout_exists") else ""
+    deck = d.get("deck") if d.get("deck_exists") else None
+    src = d.get("source_path") if t == "lvs" else None
+    if not layout and not (d.get("lib") and d.get("view")):
+        return None, ("runset has no reusable GDS and no lib/view -- open the GUI to "
+                      "set lib/view for cell %r" % cell)
+    with CONFIG_LOCK:
+        cfg_snap = dict(CONFIG)
+    meta = {
+        "tool": t, "lib": d.get("lib") or "existingGDS", "cell": cell,
+        "view": d.get("view") or "layout",
+        "deck": deck, "src_net": src, "src_view": None,
+        "runset_src": d.get("rulefile") or os.path.abspath(path),
+        "existing_gds": layout or None,
+        "cfg_snapshot": cfg_snap,
+    }
+    return meta, None
+
+
+def _cli_print_result(snap):
+    """Print a one-block result summary for a finished headless run, reusing the
+    same parsed fields the GUI shows."""
+    st = snap.get("state")
+    r = snap.get("result") or {}
+    el = _fmt_dur(snap.get("elapsed"))
+    if st == "failed" or r.get("type") == "error":
+        print("   RESULT    : FAILED after %s -- %s"
+              % (el, snap.get("error") or r.get("error") or "see run.log"))
+    elif r.get("type") == "drc":
+        print("   RESULT    : DRC %s  cell=%s  (%s)"
+              % (r.get("status"), r.get("cell") or "?", el))
+        print("               rules checked %s, violated %s, total violations %s"
+              % (r.get("total_rules"), r.get("violated_rules"), r.get("total_violations")))
+    elif r.get("type") == "lvs":
+        print("   RESULT    : LVS %s  cell=%s  (%s)"
+              % (r.get("status"), r.get("cell") or "?", el))
+        if r.get("total_unmatched") is not None:
+            print("               total unmatched (inst+nets+ports): %s"
+                  % r.get("total_unmatched"))
+    else:
+        print("   RESULT    : %s (%s)" % (st, el))
+    rd = (snap.get("meta") or {}).get("run_dir")
+    if rd:
+        print("   outputs   : %s" % rd)
+    sys.stdout.flush()
+
+
+def _cli_run_one(tool, path):
+    """Headless: launch a run from a runset and stream %/ETA to the console every
+    5s (interleaved with run_job's existing heartbeat), then print the result.
+    Returns the finished snapshot, or None if it could not start."""
+    meta, err = _runset_to_meta(tool, path)
+    print("-" * 66)
+    if err:
+        print("   --startNow %s: cannot run -- %s" % (tool.upper(), err))
+        sys.stdout.flush()
+        return None
+    print("   --startNow: running %s on cell %s" % (tool.upper(), meta["cell"]))
+    print("     runset  : %s" % path)
+    if meta.get("existing_gds"):
+        print("     GDS     : %s" % meta["existing_gds"])
+    if meta.get("deck"):
+        print("     deck    : %s" % meta["deck"])
+    if meta.get("src_net"):
+        print("     source  : %s" % meta["src_net"])
+    sys.stdout.flush()
+    job = start_job(meta)
+    try:
+        while True:
+            snap = job.snapshot()
+            if snap.get("state") in ("done", "failed"):
+                break
+            pct = snap.get("progress")
+            eta = snap.get("eta")
+            cur = ""
+            for s in snap.get("steps", []):
+                if s.get("state") == "running":
+                    cur = s.get("name", "")
+            line = ("       ...progress (%s): %s  elapsed %s"
+                    % (meta["cell"],
+                       ("%d%%" % pct) if pct is not None else "running",
+                       _fmt_dur(snap.get("elapsed"))))
+            if eta:
+                line += "  ~%s remaining (est. from prior run)" % _fmt_dur(eta)
+            if cur:
+                line += "  [%s]" % cur
+            print(line)
+            sys.stdout.flush()
+            time.sleep(5.0)
+    except KeyboardInterrupt:
+        print("\n   interrupted -- stopping the run...")
+        job.stop()
+        raise
+    snap = job.snapshot()
+    _cli_print_result(snap)
+    return snap
+
+
+def _cli_prompt_keep_gui(url):
+    """After headless run(s): ask whether to keep the GUI up. Non-interactive
+    stdin -> don't hang, just exit. Returns True to keep serving."""
+    print("=" * 66)
+    if not sys.stdin.isatty():
+        print(" (non-interactive stdin -- exiting; drop --startNow to just serve the GUI)")
+        sys.stdout.flush()
+        return False
+    print(" Run(s) complete. Open the GUI to inspect results / run more?")
+    print("   URL: %s" % url)
+    try:
+        ans = input(" Keep the GUI running? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return ans in ("", "y", "yes")
+
+
 def main():
     global CONFIG, CONFIG_PATH, RUNS_BASE
     _force_utf8_console()
@@ -3817,13 +3958,23 @@ def main():
                     help="path to an existing Calibre-Interactive _calibre.lvs_ runset; "
                          "prefill it on startup (reuses its deck, source netlist, and GDS) "
                          "so you can hit GO right away")
+    ap.add_argument("--drc", "--calibre-drc", dest="drc", metavar="PATH", default=None,
+                    help="path to an existing Calibre-Interactive _calibre.drc_ runset; "
+                         "prefill it on startup (reuses its deck and GDS) so you can hit "
+                         "GO right away")
+    ap.add_argument("--startNow", "--start-now", dest="startNow", action="store_true",
+                    help="immediately rerun the attached --drc and/or --lvs runset "
+                         "headless (no GUI needed), streaming %%/ETA to the console; "
+                         "at the end you're asked [Y/n] whether to keep the GUI up")
     args = ap.parse_args()
 
-    global STARTUP_LOGS, STARTUP_LVS
+    global STARTUP_LOGS, STARTUP_LVS, STARTUP_DRC
     STARTUP_LOGS = [os.path.abspath(os.path.expanduser(p)) for p in (args.log or [])]
     STARTUP_LVS = os.path.abspath(os.path.expanduser(args.lvs)) if args.lvs else ""
-    if STARTUP_LVS and not os.path.isfile(STARTUP_LVS):
-        sys.stderr.write("WARNING: --lvs path does not exist: %s\n" % STARTUP_LVS)
+    STARTUP_DRC = os.path.abspath(os.path.expanduser(args.drc)) if args.drc else ""
+    for flag, p in (("--lvs", STARTUP_LVS), ("--drc", STARTUP_DRC)):
+        if p and not os.path.isfile(p):
+            sys.stderr.write("WARNING: %s path does not exist: %s\n" % (flag, p))
 
     CONFIG_PATH = os.path.abspath(args.config)
     CONFIG = load_config(CONFIG_PATH)
@@ -3868,38 +4019,78 @@ def main():
     print("   cds.lib   : %s" % (resolve_cds_lib() or "(none found -- set cds_lib or launch from your project dir)"))
     if STARTUP_LVS:
         print("   --lvs     : %s" % STARTUP_LVS)
+    if STARTUP_DRC:
+        print("   --drc     : %s" % STARTUP_DRC)
     if STARTUP_LOGS:
         print("   --log     : %s" % ", ".join(STARTUP_LOGS))
+    if args.startNow:
+        print("   --startNow: rerun the attached runset(s) headless, then ask [Y/n]")
     print("   NOTE: Calibre/strmout inherit THIS shell's environment.")
     print("   Ctrl-C to stop.")
     print("=" * 66)
     sys.stdout.flush()
-    if args.open:
+
+    def _open_browser():
         if not os.environ.get("DISPLAY"):
             print("   (--open: no DISPLAY on this host -- open the URL above yourself,\n"
                   "    e.g. from your laptop after:  ssh -L %d:127.0.0.1:%d you@host)"
                   % (actual_port, actual_port))
-        else:
-            # Launch the browser with its stderr sent to /dev/null so a broken/
-            # remote browser (XPCOMGlueLoad, deprecated xdg-open, etc.) can't spam
-            # this console. If it doesn't appear, the URL above still works.
+            return
+        # Launch the browser with its stderr sent to /dev/null so a broken/remote
+        # browser (XPCOMGlueLoad, deprecated xdg-open, etc.) can't spam this console.
+        # If it doesn't appear, the URL above still works.
+        try:
+            import webbrowser
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            saved = os.dup(2)
+            os.dup2(devnull, 2)
             try:
-                import webbrowser
-                devnull = os.open(os.devnull, os.O_WRONLY)
-                saved = os.dup(2)
-                os.dup2(devnull, 2)
-                try:
-                    webbrowser.open(url)
-                finally:
-                    os.dup2(saved, 2)
-                    os.close(devnull)
-                    os.close(saved)
-            except Exception:
-                pass
-            print("   (if no browser opened, just paste the URL above into one)")
+                webbrowser.open(url)
+            finally:
+                os.dup2(saved, 2)
+                os.close(devnull)
+                os.close(saved)
+        except Exception:
+            pass
+        print("   (if no browser opened, just paste the URL above into one)")
+
+    # Serve in a background thread so a --startNow run can stream to the console
+    # while the GUI stays reachable, and so we can prompt afterwards.
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+
+    if args.startNow and not (STARTUP_DRC or STARTUP_LVS):
+        print("   --startNow: no --drc/--lvs runset given; just serving the GUI.")
+        sys.stdout.flush()
+
+    if args.startNow and (STARTUP_DRC or STARTUP_LVS):
+        # Headless: rerun the attached runset(s) now, streaming progress to the
+        # console -- no browser needed. DRC first, then LVS if both were given.
+        try:
+            for tool, rs in ((("drc", STARTUP_DRC),) if STARTUP_DRC else ()) + \
+                            ((("lvs", STARTUP_LVS),) if STARTUP_LVS else ()):
+                _cli_run_one(tool, rs)
+            keep = _cli_prompt_keep_gui(url)
+        except KeyboardInterrupt:
+            print("\nshutting down.")
+            httpd.shutdown()
+            return
+        if not keep:
+            print("shutting down.")
+            httpd.shutdown()
+            return
+        print("   keeping the GUI at %s -- Ctrl-C to stop." % url)
+        sys.stdout.flush()
+        if args.open:
+            _open_browser()
+    elif args.open:
+        _open_browser()
     sys.stdout.flush()
+
+    # Block the main thread until Ctrl-C (the server runs in server_thread).
     try:
-        httpd.serve_forever()
+        while server_thread.is_alive():
+            server_thread.join(1.0)
     except KeyboardInterrupt:
         print("\nshutting down.")
         httpd.shutdown()
